@@ -153,6 +153,18 @@ export interface PiAiProviderProfile {
    * to answer instead.
    */
   defaultInput?: PiAiModality[]
+  /**
+   * Selectable thinking levels assumed for a model on this route that
+   * declares neither its entry's {@link PiAiModelProfile.reasoningEfforts}
+   * nor a catalog entry with reasoning capability. The thinking dialect is
+   * the one the route's endpoint speaks — the values come from the provider's
+   * API documentation, the same place a `reasoningEfforts` entry takes them —
+   * so a gateway or newer model the installed catalog has not caught up with
+   * still offers thinking without listing every model. A model with its own
+   * efforts, a catalog model that reasons, and an explicit `false` all win
+   * over this fallback. Omission leaves such models non-reasoning.
+   */
+  defaultModelThinking?: false | PiAiReasoningEfforts
   /** Provider request headers; Harness attribution wins reserved names. */
   headers?: Record<string, string>
   /** Provider-neutral pi-ai reasoning level. */
@@ -331,6 +343,7 @@ const profile = z.object({
   defaultContextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW),
   defaultMaxTokens: z.number().step(1).min(1).default(DEFAULT_MAX_TOKENS),
   defaultInput: z.array(z.union(MODALITIES)).default([...DEFAULT_INPUT]),
+  defaultModelThinking: z.union([z.const(false), reasoningEfforts]),
   headers: z.dict(z.string()),
   reasoning: z.union(THINKING_LEVELS),
   thinkingBudgets,
@@ -429,6 +442,12 @@ export function resolveProfiles(
     if (defaultInput.length === 0) {
       throw new Error(`llm-pi-ai: provider "${provider}" defaultInput must name at least one modality`)
     }
+    if ((source.defaultModelThinking as unknown) === false) {
+      throw new Error(
+        `llm-pi-ai: provider "${provider}" defaultModelThinking cannot be false;`
+        + ' omit the field to leave undeclared models non-reasoning',
+      )
+    }
     // The route key, not the installed provider's own name: the directory has
     // always shown route keys, and a catalog route must not silently rename
     // itself on every configuration surface just because it gained a profile.
@@ -441,6 +460,7 @@ export function resolveProfiles(
       ...source.modelOverrides === undefined ? {} : { modelOverrides: source.modelOverrides },
       ...source.compat === undefined ? {} : { compat: source.compat },
       defaultInput,
+      ...source.defaultModelThinking === undefined ? {} : { defaultModelThinking: source.defaultModelThinking },
       defaultContextWindow: source.defaultContextWindow ?? DEFAULT_CONTEXT_WINDOW,
       defaultMaxTokens: source.defaultMaxTokens ?? DEFAULT_MAX_TOKENS,
     })

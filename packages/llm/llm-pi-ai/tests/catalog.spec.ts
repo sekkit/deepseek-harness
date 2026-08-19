@@ -684,6 +684,64 @@ describe('per-model reasoning efforts', () => {
   })
 })
 
+describe('defaultModelThinking', () => {
+  const catalogModel = getBuiltinModels('deepseek')[0]!
+
+  it('applies defaultModelThinking to a model with no reasoning of its own', () => {
+    const resolved = resolveProfiles({
+      bigcatalog: {
+        api: 'openai-completions',
+        baseURL: 'https://bigcatalog.test',
+        defaultModelThinking: { off: null, low: 'low', high: 'high' },
+        models: [{ id: 'bare', contextWindow: 4096, maxTokens: 1024 }],
+      },
+    })
+    const model = resolved.get('bigcatalog')?.piProvider.getModels()[0]
+    if (model === undefined) throw new Error('model vanished')
+    expect(model.reasoning).toBe(true)
+    expect(getSupportedThinkingLevels(model)).toEqual(['off', 'low', 'high'])
+  })
+
+  it('does not override a model that already has reasoning from the catalog', () => {
+    const resolved = resolveProfiles({
+      deepseek: {
+        defaultModelThinking: { off: null, low: 'low' },
+        models: [{ id: catalogModel.id }],
+      },
+    })
+    const model = resolved.get('deepseek')?.piProvider.getModels().find(m => m.id === catalogModel.id)
+    if (model === undefined) throw new Error('model vanished')
+    // Catalog deepseek models reason; defaultModelThinking must not replace that.
+    expect(model.reasoning).toBe(true)
+    expect(getSupportedThinkingLevels(model)).not.toEqual(['off', 'low'])
+  })
+
+  it('does not override a model with explicit reasoningEfforts', () => {
+    const resolved = resolveProfiles({
+      bigcatalog: {
+        api: 'openai-completions',
+        baseURL: 'https://bigcatalog.test',
+        defaultModelThinking: { off: null, low: 'low' },
+        models: [{ id: 'bare', contextWindow: 4096, maxTokens: 1024, reasoningEfforts: { off: null, high: 'high' } }],
+      },
+    })
+    const model = resolved.get('bigcatalog')?.piProvider.getModels()[0]
+    if (model === undefined) throw new Error('model vanished')
+    expect(getSupportedThinkingLevels(model)).toEqual(['off', 'high'])
+  })
+
+  it('rejects defaultModelThinking: false', () => {
+    expect(() => resolveProfiles({
+      bigcatalog: {
+        api: 'openai-completions',
+        baseURL: 'https://bigcatalog.test',
+        defaultModelThinking: false as never,
+        models: [{ id: 'bare', contextWindow: 4096, maxTokens: 1024 }],
+      },
+    })).toThrow(/defaultModelThinking cannot be false/)
+  })
+})
+
 describe('modelOverrides', () => {
   const deepseekModel = (): Model<Api> => {
     const [model] = getBuiltinModels('deepseek')

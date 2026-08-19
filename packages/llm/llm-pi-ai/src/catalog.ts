@@ -618,6 +618,17 @@ export interface RouteCatalogRequest {
   defaultMaxTokens: number
   /** Modalities for a model neither the entry nor the catalog declares. */
   defaultInput: Model<Api>['input']
+  /**
+   * Selectable thinking levels for models on this route that neither the
+   * entry's reasoningEfforts nor the installed catalog entry declares.
+   * When a model has no reasoning capability of its own, this dict is
+   * materialised as its model-level reasoningEfforts — so a route whose
+   * endpoint (a gateway, a self-hosted server) serves models whose
+   * thinking dialect the catalog cannot discover still offers thinking
+   * without listing every model.
+   * `false` is rejected at profile resolution.
+   */
+  defaultModelThinking?: false | PiAiReasoningEfforts
 }
 
 /** Report a route the deployment cannot serve, naming the settings key at fault. */
@@ -659,15 +670,23 @@ interface ModelReasoning {
  * exception: it stays absent from the map, which pi-ai reads as "supported,
  * send nothing" — the correct dispatch where not thinking is the parameter's
  * absence — while `off` with a value sends that value.
+ *
+ * When the entry declares no {@link PiAiModelProfile.reasoningEfforts} and
+ * the installed catalog entry carries no reasoning, the route's
+ * {@link RouteCatalogRequest.defaultModelThinking} is applied as the
+ * model-level thinking levels — useful for endpoints whose models support
+ * thinking but whose listing does not advertise it.
  * @param provider - provider route key, for diagnostics.
  * @param entry - the configured model entry.
  * @param base - the installed catalog entry of the same id, when one exists.
+ * @param defaultModelThinking - route-level fallback thinking levels.
  * @returns the reasoning fields the materialized model carries.
  */
 function resolveModelReasoning(
   provider: string,
   entry: PiAiModelProfile,
   base: Model<Api> | undefined,
+  defaultModelThinking?: false | PiAiReasoningEfforts,
 ): ModelReasoning {
   const efforts = entry.reasoningEfforts
   if (efforts === undefined) {
@@ -676,19 +695,49 @@ function resolveModelReasoning(
     // spell them, and no listing endpoint reports a model's reasoning
     // protocol. The entry's map (when any) arrives through the `...base`
     // spread in the model literal.
-    return { reasoning: base?.reasoning ?? false }
+    if (base?.reasoning ?? false) return { reasoning: true }
+    // Neither the entry nor the catalog entry declares reasoning: apply the
+    // route's default thinking levels when one is configured, so a gateway
+    // whose models all support the same thinking dialect does not need to
+    // list every model with reasoningEfforts.
+    if (defaultModelThinking !== undefined && defaultModelThinking !== false) {
+      return buildModelThinking(provider, entry.id, defaultModelThinking, 'defaultModelThinking')
+    }
+    return { reasoning: false }
   }
   // The installed entry's map may ride along through `...base`; pi-ai never
   // reads it on a non-reasoning model, so stripping it is not worth a field
   // enumeration here.
   if (efforts === false) return { reasoning: false }
+  return buildModelThinking(provider, entry.id, efforts)
+}
+
+/**
+ * Build the thinking-level map from a declared efforts dict, validating the
+ * wire spellings. Shared by a model entry's `reasoningEfforts` and the route's
+ * `defaultModelThinking` fallback; the map pins every undeclared level to
+ * null (unsupported) so pi-ai's asymmetric own-defaulting never decides.
+ * @param provider - provider route key, for diagnostics.
+ * @param modelId - the model the dict belongs to, for diagnostics.
+ * @param efforts - the declared thinking levels.
+ * @param field - the configuration field name, for diagnostics.
+ * @returns the reasoning fields the materialized model carries.
+ */
+function buildModelThinking(
+  provider: string,
+  modelId: string,
+  efforts: PiAiReasoningEfforts,
+  field = 'reasoningEfforts',
+): ModelReasoning {
   // A YAML `reasoningEfforts:` left valueless arrives as null through the
   // schema union — outside the field's declared type, hence the widening —
   // while an explicit `{}` arrives as an empty dict. Both declare nothing,
   // and neither is a spelling of "inherit" or "disable".
   if ((efforts as unknown) === null || Object.keys(efforts).length === 0) {
-    invalid(provider, `model "${entry.id}" has an empty reasoningEfforts; declare the offered levels, set`
-      + ' false for a non-reasoning model, or omit the field to keep the installed catalog\'s capability')
+    const advice = field === 'reasoningEfforts'
+      ? 'declare the offered levels, set false for a non-reasoning model, or omit the field to keep the installed catalog\'s capability'
+      : 'declare the offered levels or omit the field to leave undeclared models non-reasoning'
+    invalid(provider, `model "${modelId}" has an empty ${field}; ${advice}`)
   }
   const declared = THINKING_LEVELS.flatMap((level) => {
     const wire = efforts[level]
@@ -697,15 +746,15 @@ function resolveModelReasoning(
   for (const [level, wire] of declared) {
     if (wire === null) {
       if (level !== 'off') {
-        invalid(provider, `model "${entry.id}" reasoningEfforts.${level} needs the wire value dispatch`
+        invalid(provider, `model "${modelId}" ${field}.${level} needs the wire value dispatch`
           + ' should send; only "off" may leave it empty')
       }
     } else if (wire.length === 0) {
-      invalid(provider, `model "${entry.id}" reasoningEfforts.${level} must not be an empty string`)
+      invalid(provider, `model "${modelId}" ${field}.${level} must not be an empty string`)
     }
   }
   if (!declared.some(([level]) => level !== 'off')) {
-    invalid(provider, `model "${entry.id}" reasoningEfforts offers no level beyond "off"; declare a thinking`
+    invalid(provider, `model "${modelId}" ${field} offers no level beyond "off"; declare a thinking`
       + ' level, or set reasoningEfforts to false for a non-reasoning model')
   }
   const map: ThinkingLevelMap = {}
@@ -895,7 +944,7 @@ export function resolveRouteModels(request: RouteCatalogRequest): RouteCatalog {
       cost: base?.cost ?? NO_COST,
       contextWindow,
       maxTokens,
-      ...resolveModelReasoning(provider, entry, base),
+      ...resolveModelReasoning(provider, entry, base, request.defaultModelThinking),
       ...resolveModelCompat(provider, entry, request.compat, base, api),
     }
   })
