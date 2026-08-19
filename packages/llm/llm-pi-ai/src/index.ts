@@ -56,6 +56,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
 import { assertUsableApiKey, LlmError } from '@deepseek-ai/dsh-llm'
 import type { AdapterRegistrationHandle, DirectoryRegistrationHandle, LlmConfigurableProvider } from '@deepseek-ai/dsh-llm'
@@ -175,24 +176,41 @@ export function apply(ctx: Context, config: Config): void {
   const resolveApiKey = async (
     provider: string,
     profile: ResolvedPiAiProviderProfile,
+    ref?: string,
   ): Promise<string | undefined> => {
-    const ref = profile.apiKeyEnv
-    // Only a profile that names no credential at all defers to pi-ai's
-    // provider-native discovery. Once one is named, a miss must fail loud:
-    // handing pi-ai `undefined` would let it pick up an unrelated ambient key
-    // (OPENAI_API_KEY and friends), billing another tenant for a request the
-    // deployment meant to authenticate differently.
-    if (ref === undefined) return undefined
+    const refs = profile.keyRefs
+    if (refs.length === 0) return undefined
     const credentials = ctx.get('credentials')
-    const hit = credentials !== undefined
-      ? (await credentials.resolve(ref))?.value
-      // Without the seam the environment is the whole credential plane.
-      : launchEnvironmentOf(ctx).get(ref)?.value
-    if (hit !== undefined && hit.length > 0) return assertUsableApiKey(hit, 'llm-pi-ai', ref)
+    const resolveOne = async (name: string): Promise<string | undefined> => {
+      const ref = credentialRef(name)
+      const hit = credentials !== undefined
+        ? (await credentials.resolve(ref))?.value
+        : launchEnvironmentOf(ctx).get(name)?.value
+      if (hit !== undefined && hit.length > 0) return assertUsableApiKey(hit, 'llm-pi-ai', name)
+      return undefined
+    }
+    // A specific ref (from the scheduler's acquireSlot): fail loud if that
+    // one is missing — the scheduler will catch the MISSING_CREDENTIAL and
+    // rotate to the next key.
+    if (ref !== undefined) {
+      const key = await resolveOne(ref)
+      if (key !== undefined) return key
+      throw new LlmError(
+        `llm-pi-ai: no credential for provider route "${provider}"; its profile resolves ${ref}, which is not`
+        + ` set — store ${ref} through the credentials service (the web Models page writes it) or export it,`
+        + ' and remove apiKeyEnv only if this provider should authenticate from pi-ai\'s own environment discovery',
+        'MISSING_CREDENTIAL',
+      )
+    }
+    // No specific ref: try the pool in order and return the first set key.
+    // This path is used by model discovery (storedApiKey).
+    for (const name of refs) {
+      const key = await resolveOne(name)
+      if (key !== undefined) return key
+    }
     throw new LlmError(
-      `llm-pi-ai: no credential for provider route "${provider}"; its profile resolves ${ref}, which is not`
-      + ` set — store ${ref} through the credentials service (the web Models page writes it) or export it,`
-      + ' and remove apiKeyEnv only if this provider should authenticate from pi-ai\'s own environment discovery',
+      `llm-pi-ai: no credential for provider route "${provider}"; none of ${refs.join(', ')} are set`
+      + ' — store one through the credentials service (the web Models page writes it) or export it',
       'MISSING_CREDENTIAL',
     )
   }

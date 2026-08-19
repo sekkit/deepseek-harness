@@ -98,10 +98,10 @@ export interface ProviderSpec {
   models: readonly Model<Api>[]
   /**
    * Whether the profile names a credential, which it does through `apiKeyEnv`
-   * alone: configuration carries the reference, never the secret. Only that
-   * decides whether {@link routeAuth} adds the harness's own api-key method to
-   * a catalog provider that offers none; the key itself still arrives per
-   * request, never at construction.
+   * or `apiKeyEnvs` (the key pool): configuration carries the reference, never
+   * the secret. Only that decides whether {@link routeAuth} adds the harness's
+   * own api-key method to a catalog provider that offers none; the key itself
+   * still arrives per request, never at construction.
    */
   namesCredential: boolean
 }

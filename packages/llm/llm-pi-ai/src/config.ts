@@ -82,8 +82,21 @@ export type {
 
 /** Configuration for one pi-ai provider route; the `providers` dict key IS the route. */
 export interface PiAiProviderProfile {
-  /** Credential reference (environment-variable name) resolved per request through `ctx.credentials`. */
+  /**
+   * Credential reference (environment-variable name) resolved per request
+   * through `ctx.credentials`. The first member of the route's key pool.
+   */
   apiKeyEnv?: string
+  /**
+   * Extra credential references forming the route's key pool with
+   * {@link apiKeyEnv}. Requests rotate across the pool and automatically retry
+   * on another key when one is rate-limited, quota-exhausted, rejected for
+   * authentication, or unreachable. Add an account by listing its credential
+   * reference here; nothing else changes. A single-key route needs neither
+   * this list nor anything else: {@link apiKeyEnv} alone keeps today's
+   * behavior.
+   */
+  apiKeyEnvs?: string[]
   /** Name shown by configuration surfaces; defaults to the route key. */
   displayName?: string
   /**
@@ -157,6 +170,13 @@ export interface PiAiProviderProfile {
   /** Maximum provider idle time while one stream read is outstanding. */
   streamIdleTimeoutMs?: number
   /**
+   * Initial per-key request budget (requests per minute) for this route's key
+   * pool. Each key starts from this budget and the scheduler converges it to
+   * the account's real sustainable rate from live outcomes: successes raise
+   * it, rate-limit failures shrink it. Omission starts conservative at five.
+   */
+  requestsPerMinute?: number
+  /**
    * Maximum base64-encoded image payload per request. When a request's
    * accumulated images exceed it, the oldest images are replaced by text
    * placeholders until the request fits, so a long session keeps completing
@@ -169,13 +189,20 @@ export interface PiAiProviderProfile {
 
 /** Validated profile with its route stamped and every adapter-owned default resolved. */
 export interface ResolvedPiAiProviderProfile
-  extends Omit<PiAiProviderProfile, 'apiKeyEnv' | 'retryPolicy' | 'models' | 'displayName'> {
+  extends Omit<PiAiProviderProfile, 'apiKeyEnv' | 'apiKeyEnvs' | 'retryPolicy' | 'models' | 'displayName'> {
   /** Harness route key and the `Models` collection key (the configuration dict key). */
   provider: string
   /** Resolved display name for selectors and configuration surfaces. */
   displayName: string
-  /** Validated credential reference, when one is configured. */
+  /** Validated primary credential reference, when one is configured. */
   apiKeyEnv?: CredentialRef
+  /**
+   * The route's ordered key pool: {@link PiAiProviderProfile.apiKeyEnv} (when
+   * set) followed by {@link PiAiProviderProfile.apiKeyEnvs}, deduplicated.
+   * Requests acquire a slot on one member per attempt and rotate on failure.
+   * Empty means the route is deliberately unauthenticated.
+   */
+  keyRefs: readonly string[]
   /** Positive finite provider-idle interval after defaulting. */
   streamIdleTimeoutMs: number
   /** Positive request-level base64 image payload bound after defaulting. */
@@ -294,6 +321,7 @@ const modelOverride: z<PiAiModelOverride> = z.object(modelFields)
 
 const profile = z.object({
   apiKeyEnv: z.string().role('credential-ref'),
+  apiKeyEnvs: z.array(z.string().role('credential-ref')),
   displayName: z.string(),
   api: z.union(supportedProtocols()),
   baseURL: z.string(),
@@ -311,6 +339,7 @@ const profile = z.object({
   timeoutMs: z.natural(),
   websocketConnectTimeoutMs: z.natural(),
   streamIdleTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
+  requestsPerMinute: z.number().step(1).min(1).max(600),
   maxRequestImageBytes: z.number().step(1).min(1).default(DEFAULT_MAX_REQUEST_IMAGE_BYTES),
   retryPolicy: RetryPolicySchema,
 })
@@ -415,12 +444,20 @@ export function resolveProfiles(
       defaultContextWindow: source.defaultContextWindow ?? DEFAULT_CONTEXT_WINDOW,
       defaultMaxTokens: source.defaultMaxTokens ?? DEFAULT_MAX_TOKENS,
     })
-    const { apiKeyEnv, retryPolicy, models: _models, displayName: _displayName, ...rest } = source
+    const { apiKeyEnv, apiKeyEnvs, retryPolicy, models: _models, displayName: _displayName, ...rest } = source
+    // The route's ordered pool: the primary reference first, then the extra
+    // references, deduplicated so listing a primary again in `apiKeyEnvs` is a
+    // no-op rather than a second slot for the same credential.
+    const keyRefs = [...new Set([
+      ...apiKeyEnv === undefined ? [] : [apiKeyEnv],
+      ...apiKeyEnvs ?? [],
+    ])]
     resolved.set(provider, {
       ...rest,
       provider,
       displayName,
       ...apiKeyEnv === undefined ? {} : { apiKeyEnv: credentialRef(apiKeyEnv) },
+      keyRefs,
       streamIdleTimeoutMs,
       maxRequestImageBytes,
       retryPolicy: resolveRetryPolicy(retryPolicy, `llm-pi-ai: provider "${provider}" retryPolicy`),
@@ -433,7 +470,7 @@ export function resolveProfiles(
         ...source.api === undefined ? {} : { api: source.api },
         ...source.baseURL === undefined ? {} : { baseURL: source.baseURL },
         models: catalog.models,
-        namesCredential: apiKeyEnv !== undefined,
+        namesCredential: keyRefs.length > 0,
       }),
     })
   }
