@@ -692,6 +692,18 @@ interface ModelReasoning {
 }
 
 /**
+ * Default thinking levels by wire protocol, applied when neither a model
+ * entry nor the route default declares any. Reasoning-focused APIs uniform
+ * over their models (OpenAI Responses, and completions gateways speaking the
+ * OpenAI dialect), so a route listing bare ids still gets a working reasoning
+ * model without restating the dialect's levels per model.
+ */
+const PROTOCOL_DEFAULT_THINKING: Readonly<Record<string, PiAiReasoningEfforts>> = {
+  'openai-responses': { off: 'none', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
+  'anthropic-messages': { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh' },
+}
+
+/**
  * Resolve one model's reasoning capability from its declared efforts.
  *
  * A declared dict translates to pi-ai's `thinkingLevelMap` with every level
@@ -706,12 +718,13 @@ interface ModelReasoning {
  *
  * When the entry declares no {@link PiAiModelProfile.reasoningEfforts} and
  * the installed catalog entry carries no reasoning, the route's
- * {@link RouteCatalogRequest.defaultModelThinking} is applied as the
- * model-level thinking levels — useful for endpoints whose models support
- * thinking but whose listing does not advertise it.
+ * {@link RouteCatalogRequest.defaultModelThinking} applies; without one, the
+ * protocol's default levels ({@link PROTOCOL_DEFAULT_THINKING}) apply —
+ * endpoints whose models support thinking get it without listing every model.
  * @param provider - provider route key, for diagnostics.
  * @param entry - the configured model entry.
  * @param base - the installed catalog entry of the same id, when one exists.
+ * @param api - the model's resolved wire protocol.
  * @param defaultModelThinking - route-level fallback thinking levels.
  * @returns the reasoning fields the materialized model carries.
  */
@@ -719,6 +732,7 @@ function resolveModelReasoning(
   provider: string,
   entry: PiAiModelProfile,
   base: Model<Api> | undefined,
+  api: string,
   defaultModelThinking?: false | PiAiReasoningEfforts,
 ): ModelReasoning {
   const efforts = entry.reasoningEfforts
@@ -730,11 +744,15 @@ function resolveModelReasoning(
     // spread in the model literal.
     if (base?.reasoning ?? false) return { reasoning: true }
     // Neither the entry nor the catalog entry declares reasoning: apply the
-    // route's default thinking levels when one is configured, so a gateway
-    // whose models all support the same thinking dialect does not need to
-    // list every model with reasoningEfforts.
-    if (defaultModelThinking !== undefined && defaultModelThinking !== false) {
-      return buildModelThinking(provider, entry.id, defaultModelThinking, 'defaultModelThinking')
+    // route's default thinking levels when one is configured, then the wire
+    // protocol's own defaults, so a gateway whose models all support the same
+    // thinking dialect does not need to list every model with
+    // reasoningEfforts or set defaultModelThinking.
+    const routeDefault = defaultModelThinking !== undefined && defaultModelThinking !== false
+      ? defaultModelThinking
+      : PROTOCOL_DEFAULT_THINKING[api]
+    if (routeDefault !== undefined) {
+      return buildModelThinking(provider, entry.id, routeDefault, 'defaultModelThinking')
     }
     return { reasoning: false }
   }
@@ -977,7 +995,7 @@ export function resolveRouteModels(request: RouteCatalogRequest): RouteCatalog {
       cost: base?.cost ?? NO_COST,
       contextWindow,
       maxTokens,
-      ...resolveModelReasoning(provider, entry, base, request.defaultModelThinking),
+      ...resolveModelReasoning(provider, entry, base, api, request.defaultModelThinking),
       ...resolveModelCompat(provider, entry, request.compat, base, api),
     }
   })
