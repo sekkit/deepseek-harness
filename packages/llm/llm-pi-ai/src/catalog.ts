@@ -196,6 +196,38 @@ export function catalogProviderTakesApiKey(provider: string): boolean {
   return catalogProvider(provider)?.auth.apiKey !== undefined
 }
 
+const OPENAI_SOL_MODEL = 'gpt-5.6-sol'
+
+/**
+ * Add newly published OpenAI models when the installed pi-ai catalog lags the
+ * endpoint. The fallback inherits the current GPT-5 Responses descriptor so
+ * request dispatch stays on pi-ai's existing implementation.
+ * @param models - installed models for one provider.
+ * @returns the installed models plus supported catalog fallbacks.
+ */
+function withCatalogFallbacks(models: Model<Api>[]): Model<Api>[] {
+  if (models.some(model => model.id === OPENAI_SOL_MODEL)) return models
+  const base = models.find(model => model.id === 'gpt-5')
+  if (base === undefined) return models
+  return [...models, {
+    ...base,
+    id: OPENAI_SOL_MODEL,
+    name: 'GPT-5.6 Sol',
+    contextWindow: 272_000,
+    maxTokens: 128_000,
+    reasoning: true,
+    thinkingLevelMap: {
+      off: 'none',
+      minimal: null,
+      low: 'low',
+      medium: 'medium',
+      high: 'high',
+      xhigh: 'xhigh',
+      max: 'max',
+    },
+  }]
+}
+
 /**
  * The installed catalog models for one route, indexed by model id.
  * @param provider - provider route key.
@@ -203,7 +235,8 @@ export function catalogProviderTakesApiKey(provider: string): boolean {
  */
 export function catalogModels(provider: string): Map<string, Model<Api>> {
   if (!catalogProviders().has(provider)) return new Map()
-  const models = getBuiltinModels(provider as BuiltinProvider) as Model<Api>[]
+  const installed = getBuiltinModels(provider as BuiltinProvider) as Model<Api>[]
+  const models = provider === 'openai' ? withCatalogFallbacks(installed) : installed
   return new Map(models.map(model => [model.id, model]))
 }
 

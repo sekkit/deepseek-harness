@@ -429,6 +429,11 @@ describe('provider profile lifecycle', () => {
           ],
         },
       })
+    const models = await ctx.llm.listModels('openai')
+    expect(models.find(model => model.id === 'gpt-5.6-sol')).toEqual({
+      provider: 'openai', id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol',
+      inputModalities: ['text', 'image'],
+    })
     const extended = await ctx.llm.resolveModelInfo('openai', 'gpt-5.6-sol')
     expect(extended.reasoning?.efforts.map(effort => effort.id)).toEqual([
       ReasoningEffortId('off'),
