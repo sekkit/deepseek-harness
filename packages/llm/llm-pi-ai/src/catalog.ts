@@ -825,6 +825,18 @@ function buildModelThinking(
 type ModelCompat = OpenAICompletionsCompat | OpenAIResponsesCompat | AnthropicMessagesCompat | BedrockCompat
 
 /**
+ * Protocol-level compat defaults applied when neither the route nor the model
+ * entry sets a compat field. pi-ai's auto-detection is correct for most
+ * endpoints, but the `openai-completions` protocol defaults to `true` for
+ * `supportsDeveloperRole` on non-OpenRouter endpoints — a safe assumption for
+ * major vendors, but wrong for generic OpenAI-compatible gateways that pre-date
+ * the developer role.
+ */
+const PROTOCOL_DEFAULT_COMPAT: Readonly<Record<string, Partial<ModelCompat>>> = {
+  'openai-completions': { supportsDeveloperRole: false } as OpenAICompletionsCompat,
+}
+
+/**
  * Resolve one model's compat block from the profile's switches.
  *
  * A model switch wins over the route switch field by field; whatever neither
@@ -864,7 +876,13 @@ function resolveModelCompat(
     }
     configured[field] = value
   }
-  if (Object.keys(configured).length === 0) return {}
+  if (Object.keys(configured).length === 0) {
+    // Apply protocol-level compat defaults (overrides pi-ai's auto-detection
+    // for endpoints that do not speak the full protocol).
+    const protoDefault = PROTOCOL_DEFAULT_COMPAT[api]
+    if (protoDefault !== undefined) return { compat: protoDefault as ModelCompat }
+    return {}
+  }
   // The installed entry's compat matches the entry's OWN api — a route-level
   // `api` repoint (an anthropic catalog served through an OpenAI-compatible
   // gateway) leaves `base.compat` in the other protocol's shape, so it is
