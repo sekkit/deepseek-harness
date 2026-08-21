@@ -700,6 +700,7 @@ interface ModelReasoning {
  */
 const PROTOCOL_DEFAULT_THINKING: Readonly<Record<string, PiAiReasoningEfforts>> = {
   'openai-responses': { off: 'none', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
+  'openai-completions': { off: null, low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
   'anthropic-messages': { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh' },
 }
 
