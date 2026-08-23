@@ -177,66 +177,13 @@ export function catalogProviderIds(): readonly string[] {
 }
 
 /**
- * Whether the installed catalog provider for one route declares an api-key
- * method — the only authentication this adapter obtains on its own.
- *
- * A key is what the harness resolves through its own credential seam and hands
- * pi-ai per request. pi-ai's other method, OAuth, resolves from a *stored*
- * OAuth credential alone: `resolveProviderAuth` has no ambient path for it,
- * this adapter builds its `Models` collection with no credential store, and
- * nothing here runs a login flow. So a provider offering OAuth by itself
- * leaves nothing for this adapter to authenticate with, and the posture such a
- * provider invites — no key configured, credentials discovered by the provider
- * — fails every request with `Provider is not configured`.
- * @param provider - provider route key.
- * @returns whether the catalog provider takes an api key; false for a route
- *   pi-ai does not ship, which the caller answers for separately.
- */
-export function catalogProviderTakesApiKey(provider: string): boolean {
-  return catalogProvider(provider)?.auth.apiKey !== undefined
-}
-
-const OPENAI_SOL_MODEL = 'gpt-5.6-sol'
-
-/**
- * Add newly published OpenAI models when the installed pi-ai catalog lags the
- * endpoint. The fallback inherits the current GPT-5 Responses descriptor so
- * request dispatch stays on pi-ai's existing implementation.
- * @param models - installed models for one provider.
- * @returns the installed models plus supported catalog fallbacks.
- */
-function withCatalogFallbacks(models: Model<Api>[]): Model<Api>[] {
-  if (models.some(model => model.id === OPENAI_SOL_MODEL)) return models
-  const base = models.find(model => model.id === 'gpt-5')
-  if (base === undefined) return models
-  return [...models, {
-    ...base,
-    id: OPENAI_SOL_MODEL,
-    name: 'GPT-5.6 Sol',
-    contextWindow: 272_000,
-    maxTokens: 128_000,
-    reasoning: true,
-    thinkingLevelMap: {
-      off: 'none',
-      minimal: null,
-      low: 'low',
-      medium: 'medium',
-      high: 'high',
-      xhigh: 'xhigh',
-      max: 'max',
-    },
-  }]
-}
-
-/**
  * The installed catalog models for one route, indexed by model id.
  * @param provider - provider route key.
  * @returns catalog models by id; empty for a route pi-ai does not ship.
  */
 export function catalogModels(provider: string): Map<string, Model<Api>> {
   if (!catalogProviders().has(provider)) return new Map()
-  const installed = getBuiltinModels(provider as BuiltinProvider) as Model<Api>[]
-  const models = provider === 'openai' ? withCatalogFallbacks(installed) : installed
+  const models = getBuiltinModels(provider as BuiltinProvider) as Model<Api>[]
   return new Map(models.map(model => [model.id, model]))
 }
 
@@ -651,17 +598,6 @@ export interface RouteCatalogRequest {
   defaultMaxTokens: number
   /** Modalities for a model neither the entry nor the catalog declares. */
   defaultInput: Model<Api>['input']
-  /**
-   * Selectable thinking levels for models on this route that neither the
-   * entry's reasoningEfforts nor the installed catalog entry declares.
-   * When a model has no reasoning capability of its own, this dict is
-   * materialised as its model-level reasoningEfforts — so a route whose
-   * endpoint (a gateway, a self-hosted server) serves models whose
-   * thinking dialect the catalog cannot discover still offers thinking
-   * without listing every model.
-   * `false` is rejected at profile resolution.
-   */
-  defaultModelThinking?: false | PiAiReasoningEfforts
 }
 
 /** Report a route the deployment cannot serve, naming the settings key at fault. */
@@ -692,19 +628,6 @@ interface ModelReasoning {
 }
 
 /**
- * Default thinking levels by wire protocol, applied when neither a model
- * entry nor the route default declares any. Reasoning-focused APIs uniform
- * over their models (OpenAI Responses, and completions gateways speaking the
- * OpenAI dialect), so a route listing bare ids still gets a working reasoning
- * model without restating the dialect's levels per model.
- */
-const PROTOCOL_DEFAULT_THINKING: Readonly<Record<string, PiAiReasoningEfforts>> = {
-  'openai-responses': { off: 'none', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
-  'openai-completions': { off: null, low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
-  'anthropic-messages': { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh' },
-}
-
-/**
  * Resolve one model's reasoning capability from its declared efforts.
  *
  * A declared dict translates to pi-ai's `thinkingLevelMap` with every level
@@ -716,25 +639,15 @@ const PROTOCOL_DEFAULT_THINKING: Readonly<Record<string, PiAiReasoningEfforts>> 
  * exception: it stays absent from the map, which pi-ai reads as "supported,
  * send nothing" — the correct dispatch where not thinking is the parameter's
  * absence — while `off` with a value sends that value.
- *
- * When the entry declares no {@link PiAiModelProfile.reasoningEfforts} and
- * the installed catalog entry carries no reasoning, the route's
- * {@link RouteCatalogRequest.defaultModelThinking} applies; without one, the
- * protocol's default levels ({@link PROTOCOL_DEFAULT_THINKING}) apply —
- * endpoints whose models support thinking get it without listing every model.
  * @param provider - provider route key, for diagnostics.
  * @param entry - the configured model entry.
  * @param base - the installed catalog entry of the same id, when one exists.
- * @param api - the model's resolved wire protocol.
- * @param defaultModelThinking - route-level fallback thinking levels.
  * @returns the reasoning fields the materialized model carries.
  */
 function resolveModelReasoning(
   provider: string,
   entry: PiAiModelProfile,
   base: Model<Api> | undefined,
-  api: string,
-  defaultModelThinking?: false | PiAiReasoningEfforts,
 ): ModelReasoning {
   const efforts = entry.reasoningEfforts
   if (efforts === undefined) {
@@ -743,53 +656,19 @@ function resolveModelReasoning(
     // spell them, and no listing endpoint reports a model's reasoning
     // protocol. The entry's map (when any) arrives through the `...base`
     // spread in the model literal.
-    if (base?.reasoning ?? false) return { reasoning: true }
-    // Neither the entry nor the catalog entry declares reasoning: apply the
-    // route's default thinking levels when one is configured, then the wire
-    // protocol's own defaults, so a gateway whose models all support the same
-    // thinking dialect does not need to list every model with
-    // reasoningEfforts or set defaultModelThinking.
-    const routeDefault = defaultModelThinking !== undefined && defaultModelThinking !== false
-      ? defaultModelThinking
-      : PROTOCOL_DEFAULT_THINKING[api]
-    if (routeDefault !== undefined) {
-      return buildModelThinking(provider, entry.id, routeDefault, 'defaultModelThinking')
-    }
-    return { reasoning: false }
+    return { reasoning: base?.reasoning ?? false }
   }
   // The installed entry's map may ride along through `...base`; pi-ai never
   // reads it on a non-reasoning model, so stripping it is not worth a field
   // enumeration here.
   if (efforts === false) return { reasoning: false }
-  return buildModelThinking(provider, entry.id, efforts)
-}
-
-/**
- * Build the thinking-level map from a declared efforts dict, validating the
- * wire spellings. Shared by a model entry's `reasoningEfforts` and the route's
- * `defaultModelThinking` fallback; the map pins every undeclared level to
- * null (unsupported) so pi-ai's asymmetric own-defaulting never decides.
- * @param provider - provider route key, for diagnostics.
- * @param modelId - the model the dict belongs to, for diagnostics.
- * @param efforts - the declared thinking levels.
- * @param field - the configuration field name, for diagnostics.
- * @returns the reasoning fields the materialized model carries.
- */
-function buildModelThinking(
-  provider: string,
-  modelId: string,
-  efforts: PiAiReasoningEfforts,
-  field = 'reasoningEfforts',
-): ModelReasoning {
   // A YAML `reasoningEfforts:` left valueless arrives as null through the
   // schema union — outside the field's declared type, hence the widening —
   // while an explicit `{}` arrives as an empty dict. Both declare nothing,
   // and neither is a spelling of "inherit" or "disable".
   if ((efforts as unknown) === null || Object.keys(efforts).length === 0) {
-    const advice = field === 'reasoningEfforts'
-      ? 'declare the offered levels, set false for a non-reasoning model, or omit the field to keep the installed catalog\'s capability'
-      : 'declare the offered levels or omit the field to leave undeclared models non-reasoning'
-    invalid(provider, `model "${modelId}" has an empty ${field}; ${advice}`)
+    invalid(provider, `model "${entry.id}" has an empty reasoningEfforts; declare the offered levels, set`
+      + ' false for a non-reasoning model, or omit the field to keep the installed catalog\'s capability')
   }
   const declared = THINKING_LEVELS.flatMap((level) => {
     const wire = efforts[level]
@@ -798,15 +677,15 @@ function buildModelThinking(
   for (const [level, wire] of declared) {
     if (wire === null) {
       if (level !== 'off') {
-        invalid(provider, `model "${modelId}" ${field}.${level} needs the wire value dispatch`
+        invalid(provider, `model "${entry.id}" reasoningEfforts.${level} needs the wire value dispatch`
           + ' should send; only "off" may leave it empty')
       }
     } else if (wire.length === 0) {
-      invalid(provider, `model "${modelId}" ${field}.${level} must not be an empty string`)
+      invalid(provider, `model "${entry.id}" reasoningEfforts.${level} must not be an empty string`)
     }
   }
   if (!declared.some(([level]) => level !== 'off')) {
-    invalid(provider, `model "${modelId}" ${field} offers no level beyond "off"; declare a thinking`
+    invalid(provider, `model "${entry.id}" reasoningEfforts offers no level beyond "off"; declare a thinking`
       + ' level, or set reasoningEfforts to false for a non-reasoning model')
   }
   const map: ThinkingLevelMap = {}
@@ -823,18 +702,6 @@ function buildModelThinking(
 
 /** The compat block a materialized model carries, whichever protocol it speaks. */
 type ModelCompat = OpenAICompletionsCompat | OpenAIResponsesCompat | AnthropicMessagesCompat | BedrockCompat
-
-/**
- * Protocol-level compat defaults applied when neither the route nor the model
- * entry sets a compat field. pi-ai's auto-detection is correct for most
- * endpoints, but the `openai-completions` protocol defaults to `true` for
- * `supportsDeveloperRole` on non-OpenRouter endpoints — a safe assumption for
- * major vendors, but wrong for generic OpenAI-compatible gateways that pre-date
- * the developer role.
- */
-const PROTOCOL_DEFAULT_COMPAT: Readonly<Record<string, Partial<ModelCompat>>> = {
-  'openai-completions': { supportsDeveloperRole: false } as OpenAICompletionsCompat,
-}
 
 /**
  * Resolve one model's compat block from the profile's switches.
@@ -876,13 +743,7 @@ function resolveModelCompat(
     }
     configured[field] = value
   }
-  if (Object.keys(configured).length === 0) {
-    // Apply protocol-level compat defaults (overrides pi-ai's auto-detection
-    // for endpoints that do not speak the full protocol).
-    const protoDefault = PROTOCOL_DEFAULT_COMPAT[api]
-    if (protoDefault !== undefined) return { compat: protoDefault as ModelCompat }
-    return {}
-  }
+  if (Object.keys(configured).length === 0) return {}
   // The installed entry's compat matches the entry's OWN api — a route-level
   // `api` repoint (an anthropic catalog served through an OpenAI-compatible
   // gateway) leaves `base.compat` in the other protocol's shape, so it is
@@ -1014,7 +875,7 @@ export function resolveRouteModels(request: RouteCatalogRequest): RouteCatalog {
       cost: base?.cost ?? NO_COST,
       contextWindow,
       maxTokens,
-      ...resolveModelReasoning(provider, entry, base, api, request.defaultModelThinking),
+      ...resolveModelReasoning(provider, entry, base),
       ...resolveModelCompat(provider, entry, request.compat, base, api),
     }
   })
