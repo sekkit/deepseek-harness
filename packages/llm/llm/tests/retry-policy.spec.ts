@@ -13,7 +13,7 @@ describe('provider retry policy', () => {
     expect(policy).toEqual({
       mode: 'normal',
       maxRetries: 5,
-      retryableCodes: ['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT'],
+      retryableCodes: ['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT', 'QUOTA'],
       initialDelayMs: 500,
       maxDelayMs: 10_000,
       jitterRatio: 0.1,

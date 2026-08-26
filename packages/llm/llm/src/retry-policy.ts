@@ -9,7 +9,7 @@
 
 import z from '@deepseek-ai/schemastery'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
-import { EMPTY_RESPONSE_CODE } from './error.ts'
+import { EMPTY_RESPONSE_CODE, QUOTA_EXCEEDED_CODE } from './error.ts'
 
 const DEFAULT_MAX_RETRIES = 5
 const DEFAULT_INITIAL_DELAY_MS = 500
@@ -21,6 +21,13 @@ const DEFAULT_RETRYABLE_CODES = Object.freeze([
   'SERVER',
   'TIMEOUT',
   'TRANSPORT',
+  // A quota failure may be a workspace WINDOW gate rather than terminal
+  // billing exhaustion — e.g. SenseNova's "Workspace allocated quota
+  // exceeded": a per-workspace budget of single-digit requests per minute
+  // that rotates within a minute or two. Bounded retries ride through the
+  // window; a genuinely terminal quota (depleted balance, plan ended) only
+  // delays the surfaced error by the retry budget.
+  QUOTA_EXCEEDED_CODE,
 ])
 
 /** Bounded exponential backoff with symmetric jitter around each local delay. */
