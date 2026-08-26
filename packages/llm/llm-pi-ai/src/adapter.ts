@@ -870,6 +870,9 @@ export class PiAiAdapter extends LlmAdapter {
       // Per-attempt token accounting for the scheduler's TPM feedback
       let attemptTokens = 0
       let reported = false
+      // Whether any content chunk reached the caller this attempt; hoisted so
+      // the outer catch can decide whether a failure is safe to rotate on.
+      let yieldedAny = false
       const report = (outcome: SchedulerOutcome, tokens = attemptTokens): void => {
         if (reported) return
         reported = true
@@ -913,7 +916,6 @@ export class PiAiAdapter extends LlmAdapter {
         })
         const iterator = toStreamChunks(events, model.contextWindow)[Symbol.asyncIterator]()
         let exhausted = false
-        let yieldedAny = false
         // Failure codes that trigger a rotation to the next key when no
         // content has been yielded yet. Once any content reached the caller,
         // the response is already partial and switching mid-stream would
@@ -986,6 +988,23 @@ export class PiAiAdapter extends LlmAdapter {
         }
       } catch (error: unknown) {
         if (timeoutOf(watchdog.signal, 'LLM_STREAM_IDLE_TIMEOUT') !== undefined) {
+          // A stalled stream (gateway accepted the request but delivers
+          // nothing) is a per-key failure like any other when nothing has
+          // been yielded: rotate to the next key instead of failing the
+          // whole request — otherwise every stalled attempt costs the full
+          // idle window and the caller only sees a frozen retry counter.
+          const rotatable = chosenRef !== undefined
+            && refs.length > 1
+            && !yieldedAny
+          if (rotatable) {
+            lastCredentialError = new LlmError(
+              `[key ${chosenRef}] pi-ai stream idle timeout after ${streamIdleTimeoutMs}ms`,
+              'TIMEOUT',
+              { cause: error },
+            )
+            report('server')
+            break
+          }
           throw new LlmError(`pi-ai stream idle timeout after ${streamIdleTimeoutMs}ms`, 'TIMEOUT', { cause: error })
         }
         if (options.signal?.aborted) {
