@@ -38,6 +38,13 @@
  * every key of such a pool hits the same wall. When the cap is set it gates
  * a single-key route too, giving every route a queue with no other change.
  *
+ * A `maxRequestsPerMinute` budget adds the same queueing over TIME: the whole
+ * pool consumes one shared per-minute window, so a workspace that counts all
+ * keys against a single request window (SenseNova: "Workspace allocated
+ * quota exceeded", roughly single-digit requests per minute per workspace)
+ * never sees a burst past its budget — surplus demand waits for the next
+ * minute instead of tripping the quota and cooling every key.
+ *
  * @module dsh-llm-pi-ai/adapter
  */
 
@@ -254,8 +261,10 @@ const MIN_TPM_RESERVE = 1_000
 const MIN_KEY_GAP_MS = 1_200
 /** Pause between re-checks of the pool-wide concurrency cap. */
 const CONCURRENCY_POLL_MS = 250
-/** Cooldown (ms) after a hard quota-exhausted failure. */
-const QUOTA_COOLDOWN_MS = 300_000
+/** Cooldown (ms) after a hard quota-exhausted failure. Short: a workspace
+ *  quota window usually rotates within a minute or two, and a long cooldown
+ *  would keep the whole pool disabled far past the actual recovery. */
+const QUOTA_COOLDOWN_MS = 60_000
 /** Cooldown (ms) after an authentication failure. */
 const AUTH_COOLDOWN_MS = 600_000
 /** Cooldown (ms) after a per-key rate-limit hit. */
@@ -289,6 +298,12 @@ interface KeyGate {
   maxConcurrency: number
   /** Requests currently in flight across the whole pool. */
   inFlightTotal: number
+  /** Pool-wide request budget (requests per minute); 0 = no pool cap. */
+  poolRpm: number
+  /** Remaining pool request tokens in the current minute window. */
+  poolRpmTokens: number
+  /** Last refill instant of the pool request budget. */
+  poolRpmLast: number
 }
 
 /** Granularity of a scheduler outcome report. */
@@ -421,6 +436,7 @@ export class PiAiAdapter extends LlmAdapter {
    * @param signal - caller abort; waiting for a slot is aborted with it.
    * @param initialRpm - per-key initial rpm capacity (defaults to {@link INIT_RPM_CAPACITY}).
    * @param maxConcurrency - pool-wide in-flight cap; 0 keeps per-key fan-out.
+   * @param poolRpm - pool-wide requests-per-minute budget; 0 = no pool cap.
    * @returns the credential name chosen for this request, or undefined when
    *   every key is cooled down (the caller surfaces the last failure).
    */
@@ -430,6 +446,7 @@ export class PiAiAdapter extends LlmAdapter {
     signal?: AbortSignal,
     initialRpm?: number,
     maxConcurrency = 0,
+    poolRpm = 0,
   ): Promise<string | undefined> {
     if (refs.length === 0) return undefined
     // A single-key route with no concurrency cap has nothing to rotate or
@@ -437,14 +454,29 @@ export class PiAiAdapter extends LlmAdapter {
     // (no rate limiting, no cooldown, no gap) for the common case the pool
     // feature does not need. A cap still applies to a single-key route —
     // it is the pool-wide queue, not a rotation concern.
-    if (refs.length === 1 && maxConcurrency === 0) return refs[0]
+    if (refs.length === 1 && maxConcurrency === 0 && poolRpm === 0) return refs[0]
     const now = Date.now()
-    const gate = this.ensureGate(provider, `${String(refs)}::${maxConcurrency}`, initialRpm, maxConcurrency)
+    const gate = this.ensureGate(
+      provider,
+      `${String(refs)}::${maxConcurrency}::${poolRpm}`,
+      initialRpm,
+      maxConcurrency,
+      poolRpm,
+    )
     // Pool at its concurrency cap: surplus demand queues here, polling for a
     // slot, instead of bursting every key at the same wall at once.
     if (gate.maxConcurrency > 0 && gate.inFlightTotal >= gate.maxConcurrency) {
       await sleepAbortable(CONCURRENCY_POLL_MS, signal)
-      return this.acquireSlot(provider, refs, signal, initialRpm, maxConcurrency)
+      return this.acquireSlot(provider, refs, signal, initialRpm, maxConcurrency, poolRpm)
+    }
+    // Pool-wide request budget: a workspace that counts ALL keys against one
+    // window (e.g. SenseNova "Workspace allocated quota") must never see more
+    // than its budget requests per minute no matter how many keys exist.
+    this.refreshPoolRpm(gate, now)
+    if (gate.poolRpm > 0 && gate.poolRpmTokens < 1) {
+      const poolWait = Math.min(60_000, Math.ceil((1 - gate.poolRpmTokens) * 6e4 / gate.poolRpm))
+      await sleepAbortable(poolWait, signal)
+      return this.acquireSlot(provider, refs, signal, initialRpm, maxConcurrency, poolRpm)
     }
     gate.cursor = gate.cursor % refs.length
     // refresh every key's meters for this instant's decision
@@ -471,6 +503,7 @@ export class PiAiAdapter extends LlmAdapter {
       k.rpmTokens -= 1
       k.inFlight += 1
       gate.inFlightTotal += 1
+      if (gate.poolRpm > 0) gate.poolRpmTokens -= 1
       k.lastStartAt = now
       gate.cursor = (lookup + 1) % refs.length
       return chosen
@@ -506,10 +539,32 @@ export class PiAiAdapter extends LlmAdapter {
     waitMs = Math.min(waitMs, 60_000)
     await sleepAbortable(waitMs, signal)
     // retry until a key is free or all keys are hard-cooled
-    if (refs.every(ref => { const k = gate.keys.get(ref); return k !== undefined && k.cooldownUntil > Date.now() })) {
-      return undefined
+    const cooledNow = Date.now()
+    const allCooled = refs.every(ref => {
+      const k = gate.keys.get(ref)
+      return k !== undefined && k.cooldownUntil > cooledNow
+    })
+    if (allCooled) {
+      // A pool fully cooled by TRANSIENT failures — the shared workspace
+      // quota wall, per-key rate limits, token budgets, server blips — is a
+      // WAITING condition, not a terminal one: keep queuing until the window
+      // recovers instead of failing the task. Only a fully auth-cooled pool
+      // is terminal (those credentials need human repair), and the caller can
+      // always abort the wait.
+      if (refs.every(ref => {
+        const k = gate.keys.get(ref)
+        return k !== undefined && k.cooldownKind === 'auth'
+      })) {
+        return undefined
+      }
+      const earliest = Math.min(...refs.map(ref => {
+        const k = gate.keys.get(ref)
+        return k !== undefined && k.cooldownUntil > cooledNow ? k.cooldownUntil : Number.MAX_SAFE_INTEGER
+      }))
+      await sleepAbortable(earliest === Number.MAX_SAFE_INTEGER ? 1_000 : Math.min(60_000, earliest - cooledNow), signal)
+      return this.acquireSlot(provider, refs, signal, initialRpm, maxConcurrency, poolRpm)
     }
-    return this.acquireSlot(provider, refs, signal, initialRpm, maxConcurrency)
+    return this.acquireSlot(provider, refs, signal, initialRpm, maxConcurrency, poolRpm)
   }
 
   /**
@@ -518,8 +573,16 @@ export class PiAiAdapter extends LlmAdapter {
    * @param provider - provider route key.
    * @param poolId - identity of the ordered key pool.
    * @param initialRpm - per-key initial rpm capacity for a new gate.
+   * @param maxConcurrency - pool-wide in-flight cap for a new gate.
+   * @param poolRpm - pool-wide requests-per-minute budget for a new gate.
    */
-  private ensureGate(provider: string, poolId: string, initialRpm: number | undefined, maxConcurrency: number): KeyGate {
+  private ensureGate(
+    provider: string,
+    poolId: string,
+    initialRpm: number | undefined,
+    maxConcurrency: number,
+    poolRpm: number,
+  ): KeyGate {
     let gate = this.slots.get(provider)
     if (gate === undefined || gate.poolId !== poolId) {
       gate = {
@@ -529,10 +592,27 @@ export class PiAiAdapter extends LlmAdapter {
         initialRpm: initialRpm ?? INIT_RPM_CAPACITY,
         maxConcurrency,
         inFlightTotal: 0,
+        poolRpm,
+        poolRpmTokens: poolRpm,
+        poolRpmLast: Date.now(),
       }
       this.slots.set(provider, gate)
     }
     return gate
+  }
+
+  /**
+   * Refill the pool-wide request budget for the current instant.
+   * @param gate - the route's scheduler gate.
+   * @param now - current time.
+   */
+  private refreshPoolRpm(gate: KeyGate, now: number): void {
+    if (gate.poolRpm <= 0) return
+    const elapsed = Math.max(0, now - gate.poolRpmLast)
+    if (elapsed > 0) {
+      gate.poolRpmTokens = Math.min(gate.poolRpm, gate.poolRpmTokens + elapsed * gate.poolRpm / 6e4)
+      gate.poolRpmLast = now
+    }
   }
 
   /**
@@ -709,6 +789,7 @@ export class PiAiAdapter extends LlmAdapter {
         options.signal,
         profile.requestsPerMinute,
         profile.maxConcurrency ?? 0,
+        profile.maxRequestsPerMinute ?? 0,
       )
       if (chosenRef === undefined) {
         if (refs.length === 0) {

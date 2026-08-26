@@ -203,6 +203,16 @@ export interface PiAiProviderProfile {
    */
   maxConcurrency?: number
   /**
+   * Pool-wide cap on total requests per minute for this route. All keys of
+   * the pool share this budget, so a workspace that counts every key against
+   * ONE minute window (several credentials, one underlying account quota,
+   * e.g. the SenseNova token gateway's "Workspace allocated quota") never
+   * sees more requests than it can afford, no matter how many keys exist.
+   * Demand beyond the budget queues until the next minute window rather than
+   * failing. Omission keeps per-key budgets only.
+   */
+  maxRequestsPerMinute?: number
+  /**
    * Maximum base64-encoded image payload per request. When a request's
    * accumulated images exceed it, the oldest images are replaced by text
    * placeholders until the request fits, so a long session keeps completing
@@ -376,6 +386,7 @@ const profile = z.object({
   streamIdleTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
   requestsPerMinute: z.number().step(1).min(1).max(600),
   maxConcurrency: z.number().step(1).min(1).max(64),
+  maxRequestsPerMinute: z.number().step(1).min(1).max(600),
   maxRequestImageBytes: z.number().step(1).min(1).default(DEFAULT_MAX_REQUEST_IMAGE_BYTES),
   requestImagePixelBudget: z.number().step(1).min(1).default(DEFAULT_REQUEST_IMAGE_PIXEL_BUDGET),
   requestImageMaxBytes: z.number().step(1).min(1).default(DEFAULT_REQUEST_IMAGE_MAX_BYTES),
