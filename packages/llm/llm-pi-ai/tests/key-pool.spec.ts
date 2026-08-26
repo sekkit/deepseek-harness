@@ -10,7 +10,7 @@ import LlmRuntime, { createUserMessage } from '@deepseek-ai/dsh-llm'
 import * as LlmPiAi from '@deepseek-ai/dsh-llm-pi-ai'
 import { resolveProfiles } from '../src/config.ts'
 import { assemble } from './assemble.ts'
-import { closeMockServers, mockServer, textEvents } from './mock-server.ts'
+import { closeMockServers, mockServer, textEvents, type MockServer } from './mock-server.ts'
 
 const cleanups: Array<() => Promise<void>> = []
 
@@ -29,7 +29,7 @@ beforeEach(() => {
 /** One-shot request helper: returns the Authorization header the server saw. */
 async function requestAuth(
   providers: Record<string, LlmPiAi.PiAiProviderProfile>,
-  server: { url: string },
+  server: MockServer,
 ): Promise<string> {
   const ctx = new Context()
   cleanups.push(async () => { await ctx.fiber.dispose() })
@@ -164,6 +164,53 @@ describe('key pool rotation', () => {
     // Both keys should have been tried
     expect(server.headers[0]?.['authorization']).toBe('Bearer key-a-secret')
     expect(server.headers[1]?.['authorization']).toBe('Bearer key-b-secret')
+  })
+
+  it('queues concurrent requests beyond maxConcurrency instead of bursting the pool', async () => {
+    // Three slow streams: each holds its response open for ~240ms (4 events
+    // at delayMs 80). Without the cap all three would start within a few ms
+    // of each other; with maxConcurrency 1 each starts only after the
+    // previous one has fully finished.
+    const server = await mockServer([
+      { events: textEvents, delayMs: 80 },
+      { events: textEvents, delayMs: 80 },
+      { events: textEvents, delayMs: 80 },
+    ])
+    const providers = {
+      deepseek: {
+        apiKeyEnv: 'KEY_A',
+        apiKeyEnvs: ['KEY_B', 'KEY_C'],
+        maxConcurrency: 1,
+        baseURL: server.url,
+      } as LlmPiAi.PiAiProviderProfile,
+    }
+    const ctx = new Context()
+    cleanups.push(async () => { await ctx.fiber.dispose() })
+    await ctx.plugin(LlmRuntime)
+    await ctx.plugin(LlmPiAi, { providers })
+    const results = await Promise.all([
+      assemble(ctx, { model: 'deepseek-v4-flash', messages: [] }),
+      assemble(ctx, { model: 'deepseek-v4-flash', messages: [] }),
+      assemble(ctx, { model: 'deepseek-v4-flash', messages: [] }),
+    ])
+    expect(results.every(result => result.finish.kind === 'stop')).toBe(true)
+    expect(server.starts.length).toBe(3)
+    // The queue serializes: request N starts only after request N-1 closed.
+    for (let i = 1; i < 3; i++) {
+      const start = server.starts[i]
+      const end = server.ends[i - 1]
+      const previous = server.starts[i - 1]
+      expect(start).toBeDefined()
+      expect(end).toBeDefined()
+      expect(previous).toBeDefined()
+      expect(start!).toBeGreaterThanOrEqual(end!)
+      // and each start is measurably later than the previous one
+      expect(start! - previous!).toBeGreaterThanOrEqual(100)
+    }
+    // Requests still rotate across the pool while they queue
+    expect(server.headers[0]?.['authorization']).toBe('Bearer key-a-secret')
+    expect(server.headers[1]?.['authorization']).toBe('Bearer key-b-secret')
+    expect(server.headers[2]?.['authorization']).toBe('Bearer key-c-secret')
   })
 })
 

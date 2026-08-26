@@ -193,6 +193,16 @@ export interface PiAiProviderProfile {
    */
   requestsPerMinute?: number
   /**
+   * Pool-wide cap on concurrent in-flight requests for this route. Demand
+   * beyond the cap queues: each request waits for an in-flight slot instead
+   * of bursting the endpoint. This is the knob for a key pool whose keys all
+   * share one workspace quota wall (several credentials, one account quota):
+   * per-key fan-out alone would let every key's in-flight request hit the
+   * same wall at once. Omission keeps the pool's natural fan-out (one
+   * in-flight per key) — today's behavior.
+   */
+  maxConcurrency?: number
+  /**
    * Maximum base64-encoded image payload per request. When a request's
    * accumulated images exceed it, the oldest images are replaced by text
    * placeholders until the request fits, so a long session keeps completing
@@ -365,6 +375,7 @@ const profile = z.object({
   websocketConnectTimeoutMs: z.natural(),
   streamIdleTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
   requestsPerMinute: z.number().step(1).min(1).max(600),
+  maxConcurrency: z.number().step(1).min(1).max(64),
   maxRequestImageBytes: z.number().step(1).min(1).default(DEFAULT_MAX_REQUEST_IMAGE_BYTES),
   requestImagePixelBudget: z.number().step(1).min(1).default(DEFAULT_REQUEST_IMAGE_PIXEL_BUDGET),
   requestImageMaxBytes: z.number().step(1).min(1).default(DEFAULT_REQUEST_IMAGE_MAX_BYTES),

@@ -6,6 +6,10 @@ export interface MockServer {
   paths: string[]
   requests: unknown[]
   headers: IncomingMessage['headers'][]
+  /** Request arrival timestamps (ms epoch), indexed like `headers`. */
+  starts: number[]
+  /** Response-close timestamps (ms epoch), indexed like `headers`. */
+  ends: number[]
   readonly closedResponses: number
   responseClosed: Promise<void>
 }
@@ -36,16 +40,20 @@ export async function mockServer(script: {
   const paths: string[] = []
   const requests: unknown[] = []
   const headers: IncomingMessage['headers'][] = []
+  const starts: number[] = []
+  const ends: number[] = []
   let closedResponses = 0
   const responseClosed = Promise.withResolvers<undefined>()
   const server = createServer((request: IncomingMessage, response: ServerResponse) => {
     response.on('close', () => {
       closedResponses += 1
+      ends.push(Date.now())
       responseClosed.resolve(undefined)
     })
     let body = ''
     request.on('data', (chunk: Buffer) => { body += chunk.toString('utf8') })
     request.on('end', () => {
+      starts.push(Date.now())
       paths.push(request.url ?? '')
       requests.push(body.length === 0 ? undefined : JSON.parse(body))
       headers.push(request.headers)
@@ -76,6 +84,8 @@ export async function mockServer(script: {
     paths,
     requests,
     headers,
+    starts,
+    ends,
     responseClosed: responseClosed.promise,
     get closedResponses() { return closedResponses },
   }
