@@ -186,10 +186,14 @@ export interface PiAiProviderProfile {
   /** Maximum provider idle time while one stream read is outstanding. */
   streamIdleTimeoutMs?: number
   /**
-   * Initial per-key request budget (requests per minute) for this route's key
-   * pool. Each key starts from this budget and the scheduler converges it to
-   * the account's real sustainable rate from live outcomes: successes raise
-   * it, rate-limit failures shrink it. Omission starts conservative at five.
+   * Per-key request budget (requests per minute) for this route's key pool.
+   * Each key starts from this budget and the scheduler converges it to the
+   * account's real sustainable rate from live outcomes: successes raise it,
+   * rate-limit failures shrink it — but never ABOVE this configured value.
+   * The configured value is the hard per-key ceiling, so a workspace window
+   * of single-digit requests per minute can be respected exactly: set it
+   * below the window and the pool can never overshoot into quota 429s.
+   * Omission starts conservative at five and learns upward toward twelve.
    */
   requestsPerMinute?: number
   /**

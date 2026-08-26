@@ -294,6 +294,8 @@ interface KeyGate {
   keys: Map<string, KeyMeter>
   cursor: number
   initialRpm: number
+  /** Hard per-key ceiling AIMD never grows past; `initialRpm` when set, else 12. */
+  rpmCeiling: number
   /** Pool-wide in-flight cap; 0 keeps the natural per-key fan-out. */
   maxConcurrency: number
   /** Requests currently in flight across the whole pool. */
@@ -590,6 +592,7 @@ export class PiAiAdapter extends LlmAdapter {
         keys: new Map(),
         cursor: 0,
         initialRpm: initialRpm ?? INIT_RPM_CAPACITY,
+        rpmCeiling: initialRpm ?? RPM_MAX_CAPACITY,
         maxConcurrency,
         inFlightTotal: 0,
         poolRpm,
@@ -669,8 +672,8 @@ export class PiAiAdapter extends LlmAdapter {
     gate.inFlightTotal = Math.max(0, gate.inFlightTotal - 1)
     if (outcome === 'ok') {
       if (tokens > 0) k.tpmTokens = Math.max(0, k.tpmTokens - tokens)
-      if (k.rpmCapacity < RPM_MAX_CAPACITY) {
-        k.rpmCapacity = Math.min(RPM_MAX_CAPACITY, k.rpmCapacity + RPM_AIMD_STEP)
+      if (k.rpmCapacity < gate.rpmCeiling) {
+        k.rpmCapacity = Math.min(gate.rpmCeiling, k.rpmCapacity + RPM_AIMD_STEP)
       }
       return
     }
