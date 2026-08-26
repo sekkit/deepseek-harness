@@ -311,6 +311,10 @@ interface KeyGate {
   poolRpmTokens: number
   /** Last refill instant of the pool request budget. */
   poolRpmLast: number
+  /** Minimum ms between ANY two pool request starts; 0 = no pacing. */
+  minGapMs: number
+  /** Wall-clock instant of the pool's most recent request start. */
+  lastStartAtAny: number
 }
 
 /** Granularity of a scheduler outcome report. */
@@ -444,6 +448,7 @@ export class PiAiAdapter extends LlmAdapter {
    * @param initialRpm - per-key initial rpm capacity (defaults to {@link INIT_RPM_CAPACITY}).
    * @param maxConcurrency - pool-wide in-flight cap; 0 keeps per-key fan-out.
    * @param poolRpm - pool-wide requests-per-minute budget; 0 = no pool cap.
+   * @param minGapMs - minimum ms between ANY two pool request starts; 0 = none.
    * @returns the credential name chosen for this request, or undefined when
    *   every key is cooled down (the caller surfaces the last failure).
    */
@@ -454,6 +459,7 @@ export class PiAiAdapter extends LlmAdapter {
     initialRpm?: number,
     maxConcurrency = 0,
     poolRpm = 0,
+    minGapMs = 0,
   ): Promise<string | undefined> {
     if (refs.length === 0) return undefined
     // A single-key route with no concurrency cap has nothing to rotate or
@@ -461,20 +467,32 @@ export class PiAiAdapter extends LlmAdapter {
     // (no rate limiting, no cooldown, no gap) for the common case the pool
     // feature does not need. A cap still applies to a single-key route —
     // it is the pool-wide queue, not a rotation concern.
-    if (refs.length === 1 && maxConcurrency === 0 && poolRpm === 0) return refs[0]
+    if (refs.length === 1 && maxConcurrency === 0 && poolRpm === 0 && minGapMs === 0) return refs[0]
     const now = Date.now()
     const gate = this.ensureGate(
       provider,
-      `${String(refs)}::${maxConcurrency}::${poolRpm}`,
+      `${String(refs)}::${maxConcurrency}::${poolRpm}::${minGapMs}`,
       initialRpm,
       maxConcurrency,
       poolRpm,
+      minGapMs,
     )
     // Pool at its concurrency cap: surplus demand queues here, polling for a
     // slot, instead of bursting every key at the same wall at once.
     if (gate.maxConcurrency > 0 && gate.inFlightTotal >= gate.maxConcurrency) {
       await sleepAbortable(CONCURRENCY_POLL_MS, signal)
-      return this.acquireSlot(provider, refs, signal, initialRpm, maxConcurrency, poolRpm)
+      return this.acquireSlot(provider, refs, signal, initialRpm, maxConcurrency, poolRpm, minGapMs)
+    }
+    // Pool-wide START PACING: however many requests are waiting, no two may
+    // begin within `minGapMs` of each other — the pool never fires
+    // instantaneously, even across different keys. Gateways like SenseNova
+    // reject cross-key micro-bursts ("Request rate increased too quickly").
+    if (gate.minGapMs > 0) {
+      const gapWait = gate.minGapMs - (Date.now() - gate.lastStartAtAny)
+      if (gapWait > 0) {
+        await sleepAbortable(gapWait, signal)
+        return this.acquireSlot(provider, refs, signal, initialRpm, maxConcurrency, poolRpm, minGapMs)
+      }
     }
     // Pool-wide request budget: a workspace that counts ALL keys against one
     // window (e.g. SenseNova "Workspace allocated quota") must never see more
@@ -483,7 +501,7 @@ export class PiAiAdapter extends LlmAdapter {
     if (gate.poolRpm > 0 && gate.poolRpmTokens < 1) {
       const poolWait = Math.min(60_000, Math.ceil((1 - gate.poolRpmTokens) * 6e4 / gate.poolRpm))
       await sleepAbortable(poolWait, signal)
-      return this.acquireSlot(provider, refs, signal, initialRpm, maxConcurrency, poolRpm)
+      return this.acquireSlot(provider, refs, signal, initialRpm, maxConcurrency, poolRpm, minGapMs)
     }
     gate.cursor = gate.cursor % refs.length
     // refresh every key's meters for this instant's decision
@@ -507,6 +525,7 @@ export class PiAiAdapter extends LlmAdapter {
     }
     if (chosen !== undefined) {
       const k = gate.keys.get(chosen)!
+      gate.lastStartAtAny = Date.now()
       k.rpmTokens -= 1
       k.inFlight += 1
       gate.inFlightTotal += 1
@@ -569,9 +588,9 @@ export class PiAiAdapter extends LlmAdapter {
         return k !== undefined && k.cooldownUntil > cooledNow ? k.cooldownUntil : Number.MAX_SAFE_INTEGER
       }))
       await sleepAbortable(earliest === Number.MAX_SAFE_INTEGER ? 1_000 : Math.min(60_000, earliest - cooledNow), signal)
-      return this.acquireSlot(provider, refs, signal, initialRpm, maxConcurrency, poolRpm)
+      return this.acquireSlot(provider, refs, signal, initialRpm, maxConcurrency, poolRpm, minGapMs)
     }
-    return this.acquireSlot(provider, refs, signal, initialRpm, maxConcurrency, poolRpm)
+    return this.acquireSlot(provider, refs, signal, initialRpm, maxConcurrency, poolRpm, minGapMs)
   }
 
   /**
@@ -582,6 +601,7 @@ export class PiAiAdapter extends LlmAdapter {
    * @param initialRpm - per-key initial rpm capacity for a new gate.
    * @param maxConcurrency - pool-wide in-flight cap for a new gate.
    * @param poolRpm - pool-wide requests-per-minute budget for a new gate.
+   * @param minGapMs - pool-wide start pacing for a new gate.
    */
   private ensureGate(
     provider: string,
@@ -589,6 +609,7 @@ export class PiAiAdapter extends LlmAdapter {
     initialRpm: number | undefined,
     maxConcurrency: number,
     poolRpm: number,
+    minGapMs: number,
   ): KeyGate {
     let gate = this.slots.get(provider)
     if (gate === undefined || gate.poolId !== poolId) {
@@ -603,6 +624,8 @@ export class PiAiAdapter extends LlmAdapter {
         poolRpm,
         poolRpmTokens: poolRpm,
         poolRpmLast: Date.now(),
+        minGapMs,
+        lastStartAtAny: 0,
       }
       this.slots.set(provider, gate)
     }
@@ -813,6 +836,7 @@ export class PiAiAdapter extends LlmAdapter {
         profile.requestsPerMinute,
         profile.maxConcurrency ?? 0,
         profile.maxRequestsPerMinute ?? 0,
+        profile.minRequestGapMs ?? 0,
       )
       if (chosenRef === undefined) {
         if (refs.length === 0) {

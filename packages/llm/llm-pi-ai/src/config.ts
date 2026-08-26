@@ -217,6 +217,15 @@ export interface PiAiProviderProfile {
    */
   maxRequestsPerMinute?: number
   /**
+   * Pool-wide start pacing: minimum milliseconds between ANY two request
+   * starts across the whole pool, whatever the keys. Guarantees the pool
+   * never fires requests instantaneously back-to-back — even on different
+   * keys — which is what gateways like the SenseNova token service reject
+   * with "Request rate increased too quickly" / workspace quota walls.
+   * Omission means no pool-level pacing (only the per-key min-gap applies).
+   */
+  minRequestGapMs?: number
+  /**
    * Maximum base64-encoded image payload per request. When a request's
    * accumulated images exceed it, the oldest images are replaced by text
    * placeholders until the request fits, so a long session keeps completing
@@ -391,6 +400,7 @@ const profile = z.object({
   requestsPerMinute: z.number().step(1).min(1).max(600),
   maxConcurrency: z.number().step(1).min(1).max(64),
   maxRequestsPerMinute: z.number().step(1).min(1).max(600),
+  minRequestGapMs: z.number().step(1).min(0).max(60_000),
   maxRequestImageBytes: z.number().step(1).min(1).default(DEFAULT_MAX_REQUEST_IMAGE_BYTES),
   requestImagePixelBudget: z.number().step(1).min(1).default(DEFAULT_REQUEST_IMAGE_PIXEL_BUDGET),
   requestImageMaxBytes: z.number().step(1).min(1).default(DEFAULT_REQUEST_IMAGE_MAX_BYTES),
