@@ -35,11 +35,11 @@ await ctx.plugin(FsPolicy)
 |---|---|
 | `fs/write-intent` | 未见或已观测为缺失 → `{ kind: 'createIfAbsent' }`；已观测为存在 → `{ kind: 'replaceIfVersion', version: vObserved }`。单 slot 决策；不调用 `next()`。 |
 | `fs/edit-intent` | 未见 → `FS_NOT_OBSERVED`；已观测为缺失 → `FS_NOT_FOUND`；已观测为存在 → 返回 `{ version: vObserved }` 作为 CAS 基础。单 slot 决策；不调用 `next()`。 |
-| `fs/observed` | 为该所有者与目标记录 `{ kind: 'present', version }` 或 `{ kind: 'absent' }`。同步、只有副作用的 `WeakMap.set`。 |
+| `fs/observed` | 为该所有者与目标记录 `{ kind: 'present', version }` 或 `{ kind: 'absent' }`。同步、只有副作用的记录器写入。 |
 
 ## 已观察状态是先前观察记录；新鲜度由提供方 CAS 保证
 
-观测状态是一张以所有者为弱键、记录各目标的映射表，具有三种逻辑状态：未见、确认缺失、存在于某个版本。成功读取文件或变更会记录存在；`read` 的元数据未命中，或 `str_replace_editor` 的 `view`、`str_replace`、`insert` 命令发生元数据未命中时，都会在返回 `FS_NOT_FOUND` 前记录缺失。插件不执行文件系统 I/O：它把该状态转换为提供方防护。存在状态提供观测到的版本；缺失状态只允许 `createIfAbsent` 写入继续，edit 因没有版本基准而返回 `FS_NOT_FOUND`。窗口读取会观察整个文件的版本，因此只有文件保持不变时才允许后续的定向编辑。插件 dispose（资源释放）时会丢弃状态，并且不会跨会话持久化。
+观测状态是一张以稳定所有者键为键、记录各目标的映射表，具有三种逻辑状态：未见、确认缺失、存在于某个版本。所有者键来自会话的非空字符串 `id`（跨同一进程内的会话对象重建保持稳定，因此会话恢复后先前的观测仍然有效），无 `id` 的会话回退为按对象分配的稳定 uid，保持严格的按对象隔离。两级存储都有容量上限（最少最近使用的所有者与最旧目标被逐出）。成功读取文件或变更会记录存在；`read` 的元数据未命中，或 `str_replace_editor` 的 `view`、`str_replace`、`insert` 命令发生元数据未命中时，都会在返回 `FS_NOT_FOUND` 前记录缺失。插件不执行文件系统 I/O：它把该状态转换为提供方防护。存在状态提供观测到的版本；缺失状态只允许 `createIfAbsent` 写入继续，edit 因没有版本基准而返回 `FS_NOT_FOUND`。窗口读取会观察整个文件的版本，因此只有文件保持不变时才允许后续的定向编辑——恢复的陈旧观测最坏也只是触发提供方 CAS 的 `FS_STALE_VERSION` 重读路径，不会造成盲写。插件 dispose（资源释放）时会丢弃状态；状态只在进程内存活，不跨主机重启持久化。
 
 ## 单 slot、先到者胜
 
@@ -67,7 +67,7 @@ await ctx.plugin(FsPolicy)
 
 ## 已知限制与暂缓事项
 
-- **已观察状态无法在会话恢复后保留**：`WeakMap` 记录的持久化工作延期处理，因此恢复的会话必须重新读取文件，才能执行防护写入/编辑。
+- **已观察状态在同一进程内跨会话恢复保留，但不跨主机重启持久化**：状态以会话的稳定 `id` 为键，恢复后的会话（同进程内）继承先前的观测，无需重读；完整的主机重启仍要求重新读取文件（持久化工作延期处理）。插件 dispose（HMR）时状态被有意清空。
 - **没有 agent（智能体）会话的参与者绝无法满足策略**：它们的编辑会抛出 `FS_NOT_OBSERVED`，写入总会解析为 `createIfAbsent`，因此非 agent 调用方无法通过门禁覆盖现有文件。
 - **直接 `ctx.fs` 读取不会发出 `fs/observed`**：在 `read` 工具之外读取的文件仍未观察；后续防护编辑会以 `FS_NOT_OBSERVED` 拒绝，直到工具读取该文件。
 - **授权依据是版本新鲜度，而非视图完整性**：任何窗口读取都会授权对未变文件执行全文件覆盖，这有意弱于完整视图规则（见 [seam 拆分 Agent Note](../../../.agents/notes/implemented/simplification/2026-06-26-fsspec-style-fs-seam.zh.md)）。

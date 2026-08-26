@@ -17,13 +17,19 @@
  * `object` actor on the `fs/*` events; this plugin narrows that actor to
  * `FsObservationActor` without importing `dsh-tools`, `dsh-agent`, or `dsh-session`.
  *
- * The owner is `agent.session` when present. It is treated as an opaque object
- * identity (a `WeakMap` key); this package never reads any of its fields.
+ * The owner key is derived from `agent.session`: a session exposing a non-empty
+ * string `id` keys observed state on that stable identifier, so the state
+ * survives the session-object replacement a resume performs (within one
+ * process); a session without an `id` falls back to an opaque per-object
+ * identity. No other field is read.
  */
 export interface FsObservationActor {
   /** The agent on whose behalf the call runs, when there is one. */
   agent?: {
-    /** The session that owns observed-file state, used as an opaque key. */
+    /**
+     * The session that owns observed-file state. Its optional non-empty string
+     * `id` is used as the stable owner key when present.
+     */
     session?: object
   }
 }

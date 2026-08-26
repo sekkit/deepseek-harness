@@ -172,6 +172,37 @@ describe('multi-owner isolation', () => {
   })
 })
 
+describe('stable owner identity across session resume', () => {
+  it('a resumed session (same id, fresh object) inherits its prior observations', async () => {
+    const { ctx } = await setup()
+    ctx.emit('fs/observed', target('a.txt'), present('v0'), ownerExec({ id: 's1' }))
+    // A resume replaces the session object; the stable id is unchanged.
+    const resumed = ownerExec({ id: 's1', marker: 'new-object' })
+    expect(await editIntent(ctx, target('a.txt'), resumed)).toEqual({ version: 'v0' })
+    expect(await writeIntent(ctx, target('a.txt'), resumed)).toEqual({ kind: 'replaceIfVersion', version: 'v0' })
+  })
+
+  it('different session ids stay isolated even with identical shape', async () => {
+    const { ctx } = await setup()
+    ctx.emit('fs/observed', target('a.txt'), present('v0'), ownerExec({ id: 's1' }))
+    await expect(editIntent(ctx, target('a.txt'), ownerExec({ id: 's2' }))).rejects.toMatchObject({ code: 'FS_NOT_OBSERVED' })
+    expect(await writeIntent(ctx, target('a.txt'), ownerExec({ id: 's2' }))).toEqual({ kind: 'createIfAbsent' })
+  })
+
+  it('a confirmed-absent observation carries over a resume too (edit stays FS_NOT_FOUND)', async () => {
+    const { ctx } = await setup()
+    ctx.emit('fs/observed', target('gone.txt'), absent, ownerExec({ id: 's1' }))
+    await expect(editIntent(ctx, target('gone.txt'), ownerExec({ id: 's1' }))).rejects.toMatchObject({ code: 'FS_NOT_FOUND' })
+    expect(await writeIntent(ctx, target('gone.txt'), ownerExec({ id: 's1' }))).toEqual({ kind: 'createIfAbsent' })
+  })
+
+  it('sessions without an id keep strict per-object isolation', async () => {
+    const { ctx } = await setup()
+    ctx.emit('fs/observed', target('a.txt'), present('v0'), ownerExec({}))
+    await expect(editIntent(ctx, target('a.txt'), ownerExec({}))).rejects.toMatchObject({ code: 'FS_NOT_OBSERVED' })
+  })
+})
+
 describe('single-slot, first-wins', () => {
   it('fully decides the slot without calling next() (the bare default is unreached)', async () => {
     const { ctx } = await setup()
