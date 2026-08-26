@@ -261,10 +261,13 @@ const MIN_TPM_RESERVE = 1_000
 const MIN_KEY_GAP_MS = 1_200
 /** Pause between re-checks of the pool-wide concurrency cap. */
 const CONCURRENCY_POLL_MS = 250
-/** Cooldown (ms) after a hard quota-exhausted failure. Short: a workspace
- *  quota window usually rotates within a minute or two, and a long cooldown
- *  would keep the whole pool disabled far past the actual recovery. */
-const QUOTA_COOLDOWN_MS = 60_000
+/** Base cooldown (ms) after the first hard quota-exhausted failure. */
+const QUOTA_COOLDOWN_BASE_MS = 60_000
+/** Ceiling for the exponential quota cooldown. A punished workspace window
+ *  can take many minutes (observed 30+ minutes), so a repeat offender rests
+ *  increasingly long instead of being re-probed — each probe can refresh the
+ *  server-side punishment, which is what made the 429s keep recurring. */
+const QUOTA_COOLDOWN_MAX_MS = 30 * 60_000
 /** Cooldown (ms) after an authentication failure. */
 const AUTH_COOLDOWN_MS = 600_000
 /** Cooldown (ms) after a per-key rate-limit hit. */
@@ -286,6 +289,8 @@ interface KeyMeter {
   cooldownKind: string | null
   lastStartAt: number
   inFlight: number
+  /** Consecutive quota failures driving the exponential cooldown. */
+  quotaHits: number
 }
 
 /** Per-route scheduler gate. */
@@ -638,6 +643,7 @@ export class PiAiAdapter extends LlmAdapter {
         cooldownKind: null,
         lastStartAt: 0,
         inFlight: 0,
+        quotaHits: 0,
       }
       gate.keys.set(ref, k)
     }
@@ -675,6 +681,7 @@ export class PiAiAdapter extends LlmAdapter {
       if (k.rpmCapacity < gate.rpmCeiling) {
         k.rpmCapacity = Math.min(gate.rpmCeiling, k.rpmCapacity + RPM_AIMD_STEP)
       }
+      k.quotaHits = 0
       return
     }
     if (outcome === 'rpm') {
@@ -682,6 +689,7 @@ export class PiAiAdapter extends LlmAdapter {
       k.rpmTokens = Math.min(k.rpmTokens, k.rpmCapacity)
       k.cooldownUntil = Date.now() + RPM_COOLDOWN_MS
       k.cooldownKind = 'rpm'
+      k.quotaHits = 0
       return
     }
     if (outcome === 'tpm') {
@@ -690,17 +698,29 @@ export class PiAiAdapter extends LlmAdapter {
       k.tpmTokens = 0
       k.cooldownUntil = Date.now() + TPM_COOLDOWN_MS
       k.cooldownKind = 'tpm'
+      k.quotaHits = 0
       return
     }
-    if (outcome === 'quota' || outcome === 'auth') {
-      k.cooldownUntil = Date.now() + (outcome === 'auth' ? AUTH_COOLDOWN_MS : QUOTA_COOLDOWN_MS)
-      k.cooldownKind = outcome
+    if (outcome === 'quota') {
+      // Exponential cooldown: a punished workspace window can take many
+      // minutes (observed 30+), and each re-probe can refresh the punishment,
+      // so a repeat offender must rest progressively longer between probes.
+      const backoff = Math.min(QUOTA_COOLDOWN_MAX_MS, QUOTA_COOLDOWN_BASE_MS * 2 ** k.quotaHits)
+      k.quotaHits += 1
+      k.cooldownUntil = Date.now() + backoff
+      k.cooldownKind = 'quota'
+      return
+    }
+    if (outcome === 'auth') {
+      k.cooldownUntil = Date.now() + AUTH_COOLDOWN_MS
+      k.cooldownKind = 'auth'
       return
     }
     // server / transport: transient, brief cooldown only
     if (outcome === 'server') {
       k.cooldownUntil = Date.now() + SERVER_COOLDOWN_MS
       k.cooldownKind = 'server'
+      k.quotaHits = 0
     }
   }
 
@@ -909,7 +929,9 @@ export class PiAiAdapter extends LlmAdapter {
                   && refs.length > 1
                   && !yieldedAny
                 if (rotatable) {
-                  lastCredentialError = new LlmError(reason.failure.message, failureCode)
+                  // Tag the failure with the credential that produced it so
+                  // the surfaced error names the account (SENSENOVA_API_KEY_7).
+                  lastCredentialError = new LlmError(`[key ${chosenRef}] ${reason.failure.message}`, failureCode)
                   report(outcome)
                   break
                 }
