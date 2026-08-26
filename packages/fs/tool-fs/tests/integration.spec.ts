@@ -361,6 +361,8 @@ describe('bare provider (no dsh-fs-observation-policy)', () => {
     const result = await call('edit', { file_path: 'a.txt', old_string: 'absent', new_string: 'x' })
     expect(result.isError).toBe(true)
     expect(result.error).toMatchObject({ info: { code: 'FS_EDIT_NOT_FOUND' } })
+    // The literal-match failure carries its own recovery remedy.
+    expect(text(result)).toContain('re-read the file, then retry with an exact old_string')
   })
 
   it('neither write nor edit stats in the tool on the bare path', async () => {

@@ -1,6 +1,7 @@
 /**
  * Unit tests for the model-facing error remediation: the remedy appended to
- * guarded-mutation failures, code preservation, and passthrough behavior.
+ * guarded-mutation and literal-match failures, code preservation, and
+ * passthrough behavior.
  */
 
 import { describe, expect, it } from 'vitest'
@@ -23,8 +24,14 @@ describe('remediateFsError', () => {
     expect(remedied.code).toBe('FS_NOT_OBSERVED')
   })
 
+  it('appends the exact-copy remedy to FS_EDIT_NOT_FOUND', () => {
+    const remedied = remediateFsError(new FsError('old_string was not found in "x"', 'FS_EDIT_NOT_FOUND')) as FsError
+    expect(remedied.message).toBe('old_string was not found in "x" — re-read the file, then retry with an exact old_string copied from it')
+    expect(remedied.code).toBe('FS_EDIT_NOT_FOUND')
+  })
+
   it('leaves other FsError codes untouched', () => {
-    const original = new FsError('no match anywhere', 'FS_EDIT_NOT_FOUND')
+    const original = new FsError('read aborted', 'FS_ABORTED')
     expect(remediateFsError(original)).toBe(original)
   })
 
