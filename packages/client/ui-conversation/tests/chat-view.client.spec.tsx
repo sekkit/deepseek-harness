@@ -875,7 +875,7 @@ describe('ChatView', () => {
     const view = render(<h.ChatView {...h.props} />)
     expect(view.getByTestId('tool-seat-r1')).toBeTruthy()
     expect(h.toolOwners[0]?.block).toMatchObject({ callId: 'r1', argsRaw: '{"command":"cmd-r1"}' })
-    expect(view.getByRole('status').textContent).toBe('Deep diving...')
+    expect(view.getByRole('status').textContent).toBe('执行工具 · bash')
   })
 
   it('keeps the Tool renderer mounted when a running call settles into log order', () => {
@@ -935,7 +935,7 @@ describe('ChatView', () => {
     const view = render(<h.ChatView {...h.props} />)
     // Freshly mounted (as after a reload) yet already past the 15s gate.
     const status = view.getByRole('status')
-    expect(status.textContent).toMatch(/^Deep diving\.\.\.2分0\d秒$/)
+    expect(status.textContent).toMatch(/^等待模型响应…2分0\d秒$/)
     expect(status.querySelector('[aria-hidden="true"]')).not.toBeNull()
     act(() => {
       h.set({ queue: [{
@@ -947,7 +947,7 @@ describe('ChatView', () => {
         text: 'also',
       }] })
     })
-    expect(status.textContent).toMatch(/^Deep diving\.\.\.2分0\d秒$/)
+    expect(status.textContent).toMatch(/^等待模型响应…2分0\d秒$/)
   })
 
   it('hands each ordered root call to the keyed business-node slot', () => {
@@ -1456,5 +1456,30 @@ describe('ChatView', () => {
     const failedView = render(<failed.ChatView {...failed.props} />)
     expect(failedView.getByText('Compaction cancelled.')).toBeTruthy()
     expect(failedView.container.querySelector('[data-state="error"]')).not.toBeNull()
+  })
+
+  it('shows start-time and run-duration on each settled non-closing assistant output', () => {
+    const midTurn: AssistantMessageNode = {
+      kind: 'assistant', seq: 2, time: 6_000, turn: 1, step: 1,
+      blocks: [{ kind: 'text', text: 'first output' }],
+      timing: { stepStartTime: 2_000, firstTokenTime: 2_400, completedTime: 6_000 },
+    }
+    const closing: AssistantMessageNode = {
+      kind: 'assistant', seq: 4, time: 12_000, turn: 1, step: 2,
+      blocks: [{ kind: 'text', text: 'final answer' }],
+      timing: { stepStartTime: 7_000, firstTokenTime: 7_300, completedTime: 12_000 },
+    }
+    const h = makeHarness({
+      nodes: [user(1, 'go'), midTurn, closing],
+      turnTimings: new Map([[1, { startTime: 1_000, endTime: 13_000 }]]),
+      turnEnds: new Map([[1, 4]]),
+    })
+    const view = render(<h.ChatView {...h.props} />)
+    // The non-closing assistant output labels its own start time + run duration.
+    expect(view.getByText(/用时 4秒/)).toBeTruthy()
+    // The closing output is labeled once by the turn-tail footer, not twice.
+    expect(view.getByText('final answer')).toBeTruthy()
+    // user row + mid-turn assistant + turn-tail = three hover scopes.
+    expect(view.container.querySelectorAll('[data-time-hover-root]')).toHaveLength(3)
   })
 })

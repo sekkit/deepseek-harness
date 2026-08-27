@@ -1,4 +1,4 @@
-- banner:
+﻿- banner:
   - navigation "Session hierarchy":
     - button "workspace" [disabled]
   - img
@@ -23,9 +23,9 @@
   - img
   - text: Context injection @deepseek-ai/dsh-system-prompt
 - paragraph: partial
-- status: Deep diving...
+- status: Outputting…
 - region "To-dos":
-  - button "To-dos 1 completed · 1 in progress"
+  - button "To-dos 1 completed Â· 1 in progress"
 - img
 - text: Ongoing Goal Keep the composer context panels aligned
 - button "Pause goal":

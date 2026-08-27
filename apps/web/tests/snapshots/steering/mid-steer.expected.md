@@ -1,4 +1,4 @@
-- banner:
+﻿- banner:
   - navigation "Session hierarchy":
     - button "Use the ask_user_question tool to" [disabled]
   - img
@@ -25,7 +25,7 @@
   - img
   - img
   - text: Ask question waiting
-- status: Deep diving...
+- status: Running tool · ask_user_question
 - text: "Interjection: include the word BANANA in your final reply."
 - button "Copy":
   - img

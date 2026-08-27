@@ -1,4 +1,4 @@
-- banner:
+﻿- banner:
   - navigation "Session hierarchy":
     - button "Begin your reply with the" [disabled]
   - img
@@ -27,7 +27,7 @@
   - img
   - text: Bash Print alpha to stdout
 - paragraph: partial
-- status: Deep diving...
+- status: Outputting…
 - textbox "Message the agent"
 - button "Commands":
   - img
@@ -37,4 +37,4 @@
   - img
 - button "6% of context used"
 - button "Stop generating"
-- text: 1 turns · 1 steps LLM {{duration}} · Tool call {{duration}} TTFT avg {{duration}} · {{throughput}} tok/s Cache hit 0% Input 7.8K tok · Output 109 tok
+- text: 1 turns Â· 1 steps LLM {{duration}} Â· Tool call {{duration}} TTFT avg {{duration}} Â· {{throughput}} tok/s Cache hit 0% Input 7.8K tok Â· Output 109 tok

@@ -1,0 +1,17 @@
+/* Assistant per-output chrome: the flow body plus a hover-revealed timing
+   row (start timestamp · Ran for X) below every settled output that is not
+   the turn's closing footer. The root opts into data-time-hover-root so the
+   timing row fades in on hover/focus and stays hidden otherwise (devices
+   without hover keep it always visible). */
+
+.root {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Same optical offset as the turn-tail actions row so icons align with the
+   28px hit targets of the surrounding flow. */
+.actions {
+  margin-top: 16px;
+  margin-left: -6px;
+}

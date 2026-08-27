@@ -14,9 +14,11 @@
 // lifecycle updates replace only their own row without remounting it.
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { ConversationTimelineSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ChatNodeStore, ConversationTimelineSnapshot, RunningToolCall } from '@deepseek-ai/dsh-client-runtime/client'
 import { Button, IconChevronDownOutline14, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { ChatViewSlotProps, RenderMessageImages } from '../contract/slots.ts'
+import type { AssistantChatData, ToolChatData } from '../contract/chat-nodes.ts'
+import type { ConversationKey } from '../locales.ts'
 import { PendingSteeringBubble } from './MessageItem.tsx'
 import { ChatNodeSeat } from './ChatNodeSeat.tsx'
 import { formatRunDuration } from './message-chrome.ts'
@@ -115,11 +117,59 @@ function runningTurnStartTime(timeline: ConversationTimelineSnapshot): number | 
   return latest
 }
 
+/**
+ * Derive a phase-aware label for the running turn's current activity, so the
+ * turn status stops being a static "Deep diving..." and says what is actually
+ * being waited on (a tool, first token, thinking, or streaming output).
+ * @returns a localized label key and optional params, or null to keep the
+ *   plain "Deep diving..." fallback.
+ */
+function turnActivity(
+  timeline: ConversationTimelineSnapshot,
+  nodes: ChatNodeStore,
+): { key: ConversationKey; params?: Record<string, string> } | null {
+  const openTurn = [...timeline.turns.values()].findLast(turn => turn.status === 'open')
+  if (openTurn === undefined) return null
+  // Find the newest step belonging to the open turn and inspect its blocks and
+  // tool state directly from the materialized Chat nodes (single source of truth).
+  let streaming: AssistantChatData | undefined
+  let runningTool: RunningToolCall | undefined
+  for (const node of nodes.values()) {
+    const location = node.location
+    const inTurn = location.kind === 'turn' || location.kind === 'step'
+      ? location.turn.turn === openTurn.turn
+      : false
+    if (!inTurn) continue
+    if (node.kind === 'assistant-step') {
+      const data = node.data as AssistantChatData
+      if (data.status === 'running' && (streaming === undefined || data.step > streaming.step)) {
+        streaming = data
+      }
+    } else if (node.kind === 'tool-call') {
+      const root = (node.data as ToolChatData).root
+      if (!('kind' in root) && (runningTool === undefined || root.step > runningTool.step)) {
+        runningTool = root
+      }
+    }
+  }
+  if (runningTool !== undefined) return { key: 'chat.deepDiving.tool', params: { name: runningTool.name } }
+  if (streaming !== undefined) {
+    const hasOutput = streaming.blocks.some(block => block.kind === 'text' && block.text.trim() !== '')
+    const hasThinking = streaming.blocks.some(block => block.kind === 'reasoning' && block.text.trim() !== '')
+    if (hasOutput) return { key: 'chat.deepDiving.outputting' }
+    if (hasThinking) return { key: 'chat.deepDiving.thinking' }
+  }
+  // The turn is open but nothing has streamed yet (first-token wait).
+  return { key: 'chat.deepDiving.waiting' }
+}
+
 /** Turn-level model activity label retained across first-token, tool, and streaming phases. */
-function TurnStatus({ startTime, t }: {
+function TurnStatus({ startTime, activity, t }: {
   /** The running turn's logged `turn/start` time; null falls back to mount
    *  time when that boundary is outside the window. */
   startTime: number | null
+  /** Phase-aware label describing what the running turn is waiting on. */
+  activity: { key: ConversationKey; params?: Record<string, string> } | null
   /** The owning view's locale seat. */
   t: ChatViewSlotProps['t']
 }) {
@@ -141,7 +191,11 @@ function TurnStatus({ startTime, t }: {
   const showClock = elapsedMs >= 15_000
   return (
     <div className={css.turnStatus} role="status" aria-live="polite">
-      Deep diving...
+      <span className={css.turnStatusLabel}>
+        {activity === null
+          ? t('chat.deepDiving')
+          : t(activity.key, activity.params)}
+      </span>
       {showClock && (
         <span className={css.turnStatusClock} aria-hidden>
           {formatRunDuration(elapsedMs, t)}
@@ -215,6 +269,12 @@ export function ChatView({
     [loadImage, renderSlot],
   )
   const runningTurnStart = useMemo(() => runningTurnStartTime(timeline), [timeline])
+  // Phase-aware activity label for the running turn, re-derived on any
+  // snapshot change — cheap scan of the materialized Chat nodes.
+  const turnActivityLabel = useMemo(
+    () => running ? turnActivity(timeline, nodeStore) : null,
+    [running, timeline, nodeStore],
+  )
 
   const listRef = useRef<HTMLDivElement | null>(null)
   const columnRef = useRef<HTMLDivElement | null>(null)
@@ -450,7 +510,7 @@ export function ChatView({
               double-render the same wait. */}
           {/* Turn-level loading signal: rides the whole running turn (first-token
               wait, tool execution, streaming) so it never flickers per step. */}
-          {running && <TurnStatus startTime={runningTurnStart} t={t} />}
+          {running && <TurnStatus startTime={runningTurnStart} activity={turnActivityLabel} t={t} />}
           {pendingSteering.map(item => (
             <PendingSteeringBubble
               key={item.id}
