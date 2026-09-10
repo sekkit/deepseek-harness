@@ -389,7 +389,9 @@ export class PiAiAdapter extends LlmAdapter {
     const profiles = this.config.profiles()
     if (this.snapshot?.profiles === profiles) return this.snapshot
     const models: MutableModels = createModels(this.config.auth)
-    for (const profile of profiles.values()) models.setProvider(profile.piProvider)
+    for (const profile of profiles.values()) {
+      if (profile.piProvider !== undefined) models.setProvider(profile.piProvider)
+    }
     this.snapshot = { profiles, models }
     return this.snapshot
   }
@@ -405,7 +407,10 @@ export class PiAiAdapter extends LlmAdapter {
 
   /** The configured descriptor for one exact route/model pair within one snapshot. */
   private modelOf(snapshot: PiAiSnapshot, provider: string, model: string): Model<Api> {
-    this.profileOf(snapshot, provider)
+    const profile = this.profileOf(snapshot, provider)
+    const failure = profile.modelErrors.get(model)
+      ?? (profile.piProvider === undefined ? profile.catalogError : undefined)
+    if (failure !== undefined) throw new LlmError(failure, 'INVALID_CONFIG')
     const resolved = snapshot.models.getModel(provider, model)
     if (resolved === undefined) {
       throw new LlmError(`pi-ai provider "${provider}" has no configured model "${model}"`, 'UNKNOWN_MODEL')
@@ -510,6 +515,7 @@ export class PiAiAdapter extends LlmAdapter {
     // refresh every key's meters for this instant's decision
     for (const ref of refs) this.refreshKey(gate, ref, now)
     let chosen: string | undefined
+    let chosenMeter: KeyMeter | undefined
     let best = -1
     let lookup = -1
     for (let i = 0; i < refs.length; i++) {
@@ -524,10 +530,10 @@ export class PiAiAdapter extends LlmAdapter {
       if (k.rpmTokens < 1) continue
       if (k.tpmTokens < MIN_TPM_RESERVE) continue
       const score = k.rpmTokens * 1e6 + k.tpmTokens
-      if (score > best) { best = score; chosen = ref; lookup = idx }
+      if (score > best) { best = score; chosen = ref; chosenMeter = k; lookup = idx }
     }
-    if (chosen !== undefined) {
-      const k = gate.keys.get(chosen)!
+    if (chosen !== undefined && chosenMeter !== undefined) {
+      const k = chosenMeter
       gate.lastStartAtAny = Date.now()
       k.rpmTokens -= 1
       k.inFlight += 1
@@ -557,7 +563,7 @@ export class PiAiAdapter extends LlmAdapter {
       }
       if (wait > 0) waitFor.push(wait)
     }
-    const cooldownEarliest = Math.min(...refs.map(ref => {
+    const cooldownEarliest = Math.min(...refs.map((ref) => {
       const k = gate.keys.get(ref)
       return k !== undefined && k.cooldownUntil > now ? k.cooldownUntil : Number.MAX_SAFE_INTEGER
     }))
@@ -569,7 +575,7 @@ export class PiAiAdapter extends LlmAdapter {
     await sleepAbortable(waitMs, signal)
     // retry until a key is free or all keys are hard-cooled
     const cooledNow = Date.now()
-    const allCooled = refs.every(ref => {
+    const allCooled = refs.every((ref) => {
       const k = gate.keys.get(ref)
       return k !== undefined && k.cooldownUntil > cooledNow
     })
@@ -580,13 +586,13 @@ export class PiAiAdapter extends LlmAdapter {
       // recovers instead of failing the task. Only a fully auth-cooled pool
       // is terminal (those credentials need human repair), and the caller can
       // always abort the wait.
-      if (refs.every(ref => {
+      if (refs.every((ref) => {
         const k = gate.keys.get(ref)
         return k !== undefined && k.cooldownKind === 'auth'
       })) {
         return undefined
       }
-      const earliest = Math.min(...refs.map(ref => {
+      const earliest = Math.min(...refs.map((ref) => {
         const k = gate.keys.get(ref)
         return k !== undefined && k.cooldownUntil > cooledNow ? k.cooldownUntil : Number.MAX_SAFE_INTEGER
       }))
@@ -697,8 +703,8 @@ export class PiAiAdapter extends LlmAdapter {
    */
   private reportOutcome(provider: string, ref: string | undefined, outcome: SchedulerOutcome, tokens = 0): void {
     const gate = this.slots.get(provider)
-    if (gate === undefined) return
-    const k = gate.keys.get(ref!)
+    if (gate === undefined || ref === undefined) return
+    const k = gate.keys.get(ref)
     if (k === undefined) return
     k.inFlight = Math.max(0, k.inFlight - 1)
     gate.inFlightTotal = Math.max(0, gate.inFlightTotal - 1)
@@ -853,7 +859,7 @@ export class PiAiAdapter extends LlmAdapter {
         }
       }
 
-let apiKey: string | undefined
+      let apiKey: string | undefined
       try {
         apiKey = await this.config.resolveApiKey(options.provider, profile, chosenRef)
       } catch (error: unknown) {
@@ -922,7 +928,7 @@ let apiKey: string | undefined
           // Harness-owned and therefore win collisions.
           headers: requestHeaders(profile.headers),
         })
-        const iterator = toStreamChunks(events, model.contextWindow, options.signal)[Symbol.asyncIterator]()
+        const iterator = toStreamChunks(events, model.contextWindow, options.signal, model.id)[Symbol.asyncIterator]()
         let exhausted = false
         // Failure codes that trigger a rotation to the next key when no
         // content has been yielded yet. Once any content reached the caller,
@@ -941,10 +947,10 @@ let apiKey: string | undefined
             }
             const chunk = result.value
             // Track token consumption for the scheduler's TPM feedback
-            if (chunk.type === 'usage' && chunk.usage !== undefined) {
-              attemptTokens = (chunk.usage.inputTokens ?? 0) + (chunk.usage.outputTokens ?? 0)
+            if (chunk.type === 'usage') {
+              attemptTokens = chunk.usage.inputTokens + chunk.usage.outputTokens
             }
-            if (chunk.type === 'finish' && chunk.reason !== undefined) {
+            if (chunk.type === 'finish') {
               const reason = chunk.reason
               // Terminal success: report the scheduler outcome and yield.
               if (reason.kind === 'stop' || reason.kind === 'tool-calls' || reason.kind === 'max-tokens') {
@@ -955,7 +961,7 @@ let apiKey: string | undefined
               // Error finish: rotate when the failure is rotatable and no
               // content has been yielded (partial response would corrupt the
               // conversation if we switched mid-stream).
-              if (reason.kind === 'error' && reason.failure !== undefined) {
+              if (reason.kind === 'error') {
                 const failureCode = reason.failure.code
                 const outcome = failureOutcome(failureCode, reason.failure.message)
                 const rotatable = rotateKinds.has(failureCode)
@@ -974,14 +980,13 @@ let apiKey: string | undefined
                 yield chunk
                 continue
               }
-              // Aborted: log and surface
-              if (reason.kind === 'aborted') {
-                report('other')
-                yield chunk
-                continue
-              }
+              // Aborted — and any finish kind a later plugin merges in — is
+              // surfaced as-is; only the rotatable failures above switch keys.
+              report('other')
+              yield chunk
+              continue
             }
-            if (chunk.type !== 'finish' && chunk.type !== 'usage') yieldedAny = true
+            if (chunk.type !== 'usage') yieldedAny = true
             yield chunk
           }
         } finally {

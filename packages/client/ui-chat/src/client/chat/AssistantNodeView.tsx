@@ -23,7 +23,7 @@ export const AssistantNodeView = memo(function AssistantNodeView({
     () => owner === undefined ? undefined : fileMentions(owner),
     [fileMentions, owner],
   )
-// Per-output timing chrome: every settled assistant message gets its own
+  // Per-output timing chrome: every settled assistant message gets its own
   // start timestamp + run duration, revealed on hover (data-time-hover-root)
   // so it stays out of the flow unless wanted. The turn's closing output is
   // already labeled by the turn-tail footer (which also carries TTFT /

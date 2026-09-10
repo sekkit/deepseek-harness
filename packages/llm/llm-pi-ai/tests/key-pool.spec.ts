@@ -227,7 +227,7 @@ describe('resolveProfiles keyRefs', () => {
         apiKeyEnv: 'KEY_A',
         apiKeyEnvs: ['KEY_B', 'KEY_A', 'KEY_C'],
         baseURL: 'http://ignored',
-      } as LlmPiAi.PiAiProviderProfile,
+      },
     })
     const profile = resolved.get('deepseek')!
     expect(profile.keyRefs).toEqual(['KEY_A', 'KEY_B', 'KEY_C'])

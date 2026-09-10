@@ -58,7 +58,7 @@ class ObservedStateGate {
    */
   private owner(actor: object | undefined): string | undefined {
     // tsgolint treats object as assignable to weak FsObservationActor, while tsc still requires the structural cast for property access.
-    // See the analyzer-divergence consequence in .agents/notes/implemented/process/2026-07-29-oxlint-linter.md.
+    // See the analyzer-divergence consequence in .agents/notes/archived/process/2026-07-29-oxlint-linter.md.
     // oxlint-disable-next-line typescript/no-unnecessary-type-assertion -- The analyzers disagree on this weak type.
     const session = (actor as FsObservationActor | undefined)?.agent?.session
     if (!session) return undefined
