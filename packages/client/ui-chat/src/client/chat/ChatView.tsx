@@ -12,7 +12,7 @@ import {
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { ChatViewSlotProps, OpenFileOptions, RunningTurnActivity } from '../contract/slots.ts'
 import type { ChatNodeStore, ChatSnapshot } from '../contract/snapshot.ts'
-import type { AssistantChatData } from '../contract/chat-nodes.ts'
+import type { AssistantChatData, ToolChatData } from '../contract/chat-nodes.ts'
 import { PendingSteeringBubble, PendingSubmissionBubble } from './MessageItem.tsx'
 import { ChatNodeSeat } from './ChatNodeSeat.tsx'
 import { ChatGroupSeat } from './ChatGroupSeat.tsx'
@@ -83,12 +83,12 @@ function turnActivity(
       : false
     if (!inTurn) continue
     if (node.kind === 'assistant-step') {
-      const data = node.data
+      const data = node.data as AssistantChatData
       if (data.status === 'running' && (streaming === undefined || data.step > streaming.step)) {
         streaming = data
       }
     } else if (node.kind === 'tool-call') {
-      const root = node.data.root
+      const root = (node.data as ToolChatData).root
       if (!('kind' in root) && (runningTool === undefined || root.step > runningTool.step)) {
         runningTool = root
       }
