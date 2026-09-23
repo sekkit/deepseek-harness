@@ -39,7 +39,7 @@ async function requestAuth(
     model: 'deepseek-v4-flash',
     messages: [createUserMessage({
       content: [{ type: 'text', text: 'hi' }],
-      source: { kind: 'plugin', plugin: 'test' },
+      source: { kind: 'test' },
     })],
   })
   return server.headers[0]?.['authorization'] as string
@@ -95,7 +95,7 @@ describe('key pool rotation', () => {
       model: 'deepseek-v4-flash',
       messages: [createUserMessage({
         content: [{ type: 'text', text: 'hi' }],
-        source: { kind: 'plugin', plugin: 'test' },
+        source: { kind: 'test' },
       })],
     })
     // The request should have succeeded after rotating to KEY_B
@@ -124,7 +124,7 @@ describe('key pool rotation', () => {
       model: 'deepseek-v4-flash',
       messages: [createUserMessage({
         content: [{ type: 'text', text: 'hi' }],
-        source: { kind: 'plugin', plugin: 'test' },
+        source: { kind: 'test' },
       })],
     })
     // Should have succeeded with KEY_B
@@ -153,7 +153,7 @@ describe('key pool rotation', () => {
       model: 'deepseek-v4-flash',
       messages: [createUserMessage({
         content: [{ type: 'text', text: 'hi' }],
-        source: { kind: 'plugin', plugin: 'test' },
+        source: { kind: 'test' },
       })],
     })
     // Both keys exhausted: the last failure surfaces as an error finish
