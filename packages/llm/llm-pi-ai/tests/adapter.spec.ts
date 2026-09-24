@@ -123,6 +123,34 @@ describe('PiAiAdapter provider routing', () => {
     expect(server.headers[0]?.['user-agent']).toBe(userAgent())
   })
 
+  it('sends x-opencode-session on OpenCode Go routes and not on plain ones', async () => {
+    const server = await mockServer([{ events: textEvents }])
+    const ctx = new Context()
+    await ctx.plugin(LlmRuntime)
+    ctx.llm.registerAdapter(['opencode-go'], adapterOf({
+      'opencode-go': {
+        apiKeyEnv: 'PI_TEST_KEY',
+        baseURL: server.url,
+        api: 'openai-completions',
+        models: [{ id: 'deepseek-v4-flash', contextWindow: 1000000, maxTokens: 384000 }],
+      },
+    }))
+    await assemble(ctx, {
+      provider: 'opencode-go',
+      model: 'deepseek-v4-flash',
+      messages: [],
+      sessionId: 'test-conversation-42' as never,
+    })
+    expect(server.headers[0]?.['x-opencode-session']).toBe('test-conversation-42')
+  })
+
+  it('does not attach x-opencode-session on routes that are not opencode', async () => {
+    const server = await mockServer([{ events: textEvents }])
+    const ctx = await harness(server.url)
+    await assemble(ctx, { model: 'deepseek-v4-flash', messages: [] })
+    expect(server.headers[0]?.['x-opencode-session']).toBeUndefined()
+  })
+
   it('forwards common stream options and profile reasoning', async () => {
     const server = await mockServer([{ events: textEvents }])
     const ctx = await harness(server.url, {
@@ -414,8 +442,13 @@ describe('PiAiAdapter provider routing', () => {
   })
 
   it('stops the SDK request when the adapter idle watchdog expires', async () => {
+    // maxRetries: 0 keeps the single-key idle timeout a hard failure so this
+    // test asserts the SDK request is aborted rather than retried in place.
     const server = await mockServer([{ events: textEvents, delayMs: 200 }])
-    const ctx = await harness(server.url, { streamIdleTimeoutMs: 20 })
+    const ctx = await harness(server.url, {
+      streamIdleTimeoutMs: 20,
+      retryPolicy: { mode: 'normal', maxRetries: 0 },
+    })
 
     const result = await assemble(ctx, { model: 'deepseek-v4-flash', messages: [] })
     expect(result.finish).toMatchObject({ kind: 'error', failure: { code: 'TIMEOUT' } })
@@ -428,6 +461,25 @@ describe('PiAiAdapter provider routing', () => {
 
     expect(server.paths).toEqual(['/chat/completions'])
     expect(server.closedResponses).toBe(1)
+  })
+
+  it('retries a stalled single-key stream in place instead of failing the turn', async () => {
+    // First response stalls past the idle window; the retry succeeds. The
+    // caller must see the recovered content, not a silent TIMEOUT turn error.
+    const server = await mockServer([
+      { events: textEvents, delayMs: 200 },
+      { events: textEvents },
+    ])
+    const ctx = await harness(server.url, {
+      streamIdleTimeoutMs: 20,
+      retryPolicy: { mode: 'normal', maxRetries: 3, backoff: { initialDelayMs: 1, maxDelayMs: 5, jitterRatio: 0 } },
+    })
+
+    const result = await assemble(ctx, { model: 'deepseek-v4-flash', messages: [] })
+
+    expect(result.finish).toMatchObject({ kind: 'stop' })
+    // Two requests: the stalled first attempt plus the in-place retry.
+    expect(server.paths).toEqual(['/chat/completions', '/chat/completions'])
   })
 })
 
@@ -597,6 +649,30 @@ describe('provider profile lifecycle', () => {
         ],
         defaultEffort: ReasoningEffortId('high'),
       },
+    })
+  })
+
+  it('defaults an unconfigured effort to the highest supported level (max-capability switching)', async () => {
+    const ctx = new Context()
+    await ctx.plugin(LlmRuntime)
+    await ctx.plugin(LlmPiAi, {
+      providers: {
+        'acme-gateway': {
+          apiKeyEnv: 'PI_TEST_KEY',
+          api: 'openai-completions',
+          baseURL: 'https://acme.test/v1',
+          models: [{
+            id: 'acme-think',
+            contextWindow: 65_536,
+            maxTokens: 4096,
+            reasoningEfforts: { off: null, low: 'low', high: 'high', max: 'max' },
+          }],
+        },
+      },
+    })
+    // No profile reasoning: the picker defaults to the model's ceiling.
+    await expect(ctx.llm.resolveModelInfo('acme-gateway', 'acme-think')).resolves.toMatchObject({
+      reasoning: { defaultEffort: ReasoningEffortId('max') },
     })
   })
 

@@ -48,6 +48,7 @@
  * @module dsh-llm-pi-ai/adapter
  */
 
+import { randomUUID } from 'node:crypto'
 import type {
   Api,
   AuthContext,
@@ -81,6 +82,7 @@ import type {
 import type { AttachmentStore, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
 import type { ResolvedPiAiProviderProfile } from './config.ts'
+import { THINKING_LEVELS } from './catalog.ts'
 import { toPiContext } from './context.ts'
 import { createModels, getSupportedThinkingLevels } from './models.ts'
 import { toStreamChunks } from './stream.ts'
@@ -159,6 +161,39 @@ function profileOptions(
 }
 
 /**
+ * Safety-net `onPayload` for DeepSeek-format endpoints that require
+ * `reasoning_content` on every assistant message carrying `tool_calls`
+ * while thinking mode is on. pi-ai's own fallback sets it to `""` when
+ * no thinking blocks survive cross-model/foreign replay (they are
+ * converted to text by `transformMessages`), and some gateways
+ * (SenseNova) reject `""` with a 400. This patch walks the final
+ * payload's messages and replaces any empty-string `reasoning_content`
+ * on tool-call-bearing assistant messages with a single space, which
+ * satisfies the "must be passed back" check without fabricating
+ * reasoning the model did not produce.
+ */
+function reasoningContentSafetyNet(model: Model<Api>): ((payload: unknown, _model: Model<Api>) => unknown) | undefined {
+  const compat = model.compat as Record<string, unknown> | undefined
+  if (compat?.requiresReasoningContentOnAssistantMessages !== true) return undefined
+  if (!model.reasoning) return undefined
+  return (payload: unknown): unknown => {
+    if (payload === null || typeof payload !== 'object') return undefined
+    const params = payload as { messages?: unknown[] }
+    const messages = params.messages
+    if (!Array.isArray(messages)) return undefined
+    for (const msg of messages) {
+      if (msg === null || typeof msg !== 'object') continue
+      const m = msg as { role?: string; tool_calls?: unknown[]; reasoning_content?: string }
+      if (m.role !== 'assistant' || m.tool_calls === undefined || m.tool_calls.length === 0) continue
+      if (m.reasoning_content === undefined || m.reasoning_content === '') {
+        m.reasoning_content = ' '
+      }
+    }
+    return undefined
+  }
+}
+
+/**
  * The profile default this exact model can actually take, for DESCRIBING it.
  * A configured level the model does not support yields none rather than
  * throwing: `resolveModel` builds the model catalog, and a catalog that fails
@@ -193,6 +228,25 @@ function resolveReasoningLevel(
     `pi-ai provider "${model.provider}" model "${model.id}" does not support reasoning effort "${effort}"`,
     'UNSUPPORTED_REASONING_EFFORT',
   )
+}
+
+/**
+ * The highest thinking level a model can take: the max-capability default
+ * offered when a profile leaves reasoning unconfigured, so switching to any
+ * thinking model defaults the effort to its ceiling instead of the model's
+ * own (usually lower) default.
+ * @param model - the resolved model descriptor.
+ * @returns the highest supported level, or undefined when the model reasons not.
+ */
+function highestSupportedLevel(model: Model<Api>): ModelThinkingLevel | undefined {
+  const levels = getSupportedThinkingLevels(model)
+  let best: ModelThinkingLevel | undefined
+  for (const level of levels) {
+    if (THINKING_LEVELS.indexOf(level) > (best === undefined ? -1 : THINKING_LEVELS.indexOf(best))) {
+      best = level
+    }
+  }
+  return best
 }
 
 /**
@@ -236,6 +290,29 @@ function requestHeaders(headers: Readonly<Record<string, string>> | undefined): 
     ...Object.fromEntries(Object.entries(headers ?? {}).filter(([name]) => !reserved.has(name.toLowerCase()))),
     ...attribution,
   }
+}
+
+/**
+ * OpenCode Go (opencode.ai/zen/go/*) rejects requests that omit the
+ * `x-opencode-session` header with a 400 `MissingSessionID` before looking at
+ * the payload, so every request to an opencode-family endpoint must carry one.
+ * The header is a stable per-conversation id for routing and prompt caching,
+ * never a credential — the DSH request's own session id is ideal, with a
+ * per-process stable fallback when the caller supplies none.
+ */
+let opencodeSessionFallback: string | undefined
+function opencodeSessionHeaders(
+  model: { readonly provider?: string; readonly baseUrl?: string } | undefined,
+  requestSessionId: string | undefined,
+): Record<string, string> {
+  const host = model?.baseUrl ?? ''
+  if (model?.provider !== 'opencode' && model?.provider !== 'opencode-go' && !host.includes('opencode.ai')) {
+    return {}
+  }
+  const id = requestSessionId !== undefined && requestSessionId.length > 0
+    ? requestSessionId
+    : (opencodeSessionFallback ??= `dsh-${randomUUID()}`)
+  return { 'x-opencode-session': id }
 }
 
 // ── Adaptive multi-key scheduler ──────────────────────────────────────────
@@ -479,7 +556,7 @@ export class PiAiAdapter extends LlmAdapter {
     const now = Date.now()
     const gate = this.ensureGate(
       provider,
-      `${String(refs)}::${maxConcurrency}::${poolRpm}::${minGapMs}`,
+      `${String(refs)}`,
       initialRpm,
       maxConcurrency,
       poolRpm,
@@ -637,6 +714,25 @@ export class PiAiAdapter extends LlmAdapter {
         lastStartAtAny: 0,
       }
       this.slots.set(provider, gate)
+      return gate
+    }
+    // Hot reload of a live key pool: same refs, reshaped limits. Reshape the
+    // gate's caps in place and keep every learned per-key meter (AIMD budgets,
+    // cooldowns, in-flight), clamping only what a lower ceiling invalidates —
+    // a settings edit must not make the pool relearn quota the hard way.
+    const ceiling = initialRpm ?? RPM_MAX_CAPACITY
+    gate.rpmCeiling = ceiling
+    gate.initialRpm = initialRpm ?? INIT_RPM_CAPACITY
+    gate.maxConcurrency = maxConcurrency
+    gate.poolRpm = poolRpm
+    gate.poolRpmTokens = poolRpm
+    gate.minGapMs = minGapMs
+    gate.lastStartAtAny = 0
+    for (const meter of gate.keys.values()) {
+      if (meter.rpmCapacity > ceiling) {
+        meter.rpmCapacity = Math.max(RPM_MIN_CAPACITY, ceiling)
+      }
+      if (meter.rpmTokens > ceiling) meter.rpmTokens = Math.max(RPM_MIN_CAPACITY, ceiling)
     }
     return gate
   }
@@ -784,6 +880,7 @@ export class PiAiAdapter extends LlmAdapter {
     const profile = this.profileOf(snapshot, provider)
     const resolvedModel = this.modelOf(snapshot, provider, model)
     const defaultLevel = describableReasoningLevel(resolvedModel, profile.reasoning)
+    ?? (profile.reasoning === undefined ? highestSupportedLevel(resolvedModel) : undefined)
     // Only a cap the deployment configured is a request default; the
     // catalog's `maxTokens` sizes the model and stops there.
     const configuredMaxTokens = profile.configuredMaxTokens.get(model)
@@ -830,11 +927,26 @@ export class PiAiAdapter extends LlmAdapter {
     )
     const refs = profile.keyRefs
     // With a key pool each attempt uses a different credential; without one
-    // the single attempt shares the unauthenticated route behaviour.
-    const attempts = refs.length === 0 ? 1 : refs.length
+    // the single attempt shares the unauthenticated route behaviour. A
+    // single-key (or keyless) route cannot rotate on a stalled stream, so it
+    // instead gets bounded same-key retries from the provider retry policy —
+    // otherwise one idle timeout surfaces as a dead turn the caller never
+    // recovers from (the "waiting then silently gone" failure).
+    const retryPolicy = profile.retryPolicy
+    const idleRetries = refs.length <= 1
+      ? (retryPolicy.mode === 'always'
+        ? Number.MAX_SAFE_INTEGER
+        : (retryPolicy.retryableCodes.includes('TIMEOUT') ? retryPolicy.maxRetries : 0))
+      : 0
+    const attempts = (refs.length === 0 ? 1 : refs.length) + idleRetries
+    // Backoff state for same-key stall retries; only consumed on idle timeouts.
+    let idleRetryCount = 0
     let lastCredentialError: LlmError | undefined
 
+    const wall0 = Date.now()
     for (let attempt = 0; attempt < attempts; attempt++) {
+      const attemptStartMs = Date.now()
+      console.error(`[llm-trace] ${options.provider}/${options.model} attempt ${attempt} begin`)
       // Acquire a slot: picks the healthiest key, or waits briefly for one
       // to become eligible. A single-key route bypasses the scheduler, so its
       // behavior is unchanged from a route with no pool.
@@ -858,6 +970,7 @@ export class PiAiAdapter extends LlmAdapter {
           )
         }
       }
+      console.error(`[llm-trace] ${options.provider}/${options.model} attempt ${attempt} slot=${chosenRef ?? 'none'} wait=${Date.now() - attemptStartMs}ms`)
 
       let apiKey: string | undefined
       try {
@@ -918,6 +1031,7 @@ export class PiAiAdapter extends LlmAdapter {
               maxBytes: profile.requestImageMaxBytes,
             },
           }, onReplayDegrade)
+        const onPayload = reasoningContentSafetyNet(model)
         const events = snapshot.models.streamSimple(model, context, {
           ...profileOptions(profile, reasoning, apiKey),
           ...options.temperature === undefined ? {} : { temperature: options.temperature },
@@ -925,11 +1039,22 @@ export class PiAiAdapter extends LlmAdapter {
           ...options.sessionId === undefined ? {} : { sessionId: String(options.sessionId) },
           signal: watchdog.signal,
           // Profile headers are deployment-owned; attribution names are
-          // Harness-owned and therefore win collisions.
-          headers: requestHeaders(profile.headers),
+          // Harness-owned and therefore win collisions. OpenCode Go also
+          // requires the per-conversation session header on every request;
+          // the request's own session id is the best value and wins a static
+          // deployment value when both are present.
+          headers: {
+            ...requestHeaders(profile.headers),
+            ...opencodeSessionHeaders(model, options.sessionId === undefined ? undefined : String(options.sessionId)),
+          },
+          // Safety net: ensure reasoning_content is non-empty on tool-call
+          // turns for DeepSeek-format endpoints that require it.
+          ...onPayload === undefined ? {} : { onPayload },
         })
+        console.error(`[llm-trace] ${options.provider}/${options.model} attempt ${attempt} stream-open +${Date.now() - wall0}ms`)
         const iterator = toStreamChunks(events, model.contextWindow, options.signal, model.id)[Symbol.asyncIterator]()
         let exhausted = false
+        let firstChunkMs = -1
         // Failure codes that trigger a rotation to the next key when no
         // content has been yielded yet. Once any content reached the caller,
         // the response is already partial and switching mid-stream would
@@ -946,6 +1071,10 @@ export class PiAiAdapter extends LlmAdapter {
               return
             }
             const chunk = result.value
+            if (firstChunkMs < 0 && chunk.type !== 'usage' && chunk.type !== 'finish') {
+              firstChunkMs = Date.now() - wall0
+              console.error(`[llm-trace] ${options.provider}/${options.model} attempt ${attempt} first-chunk +${firstChunkMs}ms`)
+            }
             // Track token consumption for the scheduler's TPM feedback
             if (chunk.type === 'usage') {
               attemptTokens = chunk.usage.inputTokens + chunk.usage.outputTokens
@@ -972,6 +1101,7 @@ export class PiAiAdapter extends LlmAdapter {
                   // Tag the failure with the credential that produced it so
                   // the surfaced error names the account (SENSENOVA_API_KEY_7).
                   lastCredentialError = new LlmError(`[key ${chosenRef}] ${reason.failure.message}`, failureCode)
+                  console.error(`[llm-trace] ${options.provider}/${options.model} attempt ${attempt} FAIL code=${failureCode} msg=${reason.failure.message} +${Date.now() - wall0}ms (rotate key)`)
                   report(outcome)
                   break
                 }
@@ -1015,9 +1145,26 @@ export class PiAiAdapter extends LlmAdapter {
               'TIMEOUT',
               { cause: error },
             )
+            console.error(`[llm-trace] ${options.provider}/${options.model} attempt ${attempt} IDLE-TIMEOUT after ${streamIdleTimeoutMs}ms +${Date.now() - wall0}ms (rotate key)`)
             report('server')
             break
           }
+          // Single-key (or keyless) route with nothing yielded and retries
+          // left: back off and re-attempt with the same credential instead of
+          // failing the turn. This is the self-healing path for the common
+          // "cold prefill on a huge context stalls past the idle window" case.
+          if (!yieldedAny && idleRetryCount < idleRetries) {
+            const delay = Math.min(
+              retryPolicy.maxDelayMs,
+              retryPolicy.initialDelayMs * 2 ** idleRetryCount,
+            )
+            idleRetryCount++
+            console.error(`[llm-trace] ${options.provider}/${options.model} attempt ${attempt} IDLE-TIMEOUT after ${streamIdleTimeoutMs}ms +${Date.now() - wall0}ms (retry same key #${idleRetryCount} in ${delay}ms)`)
+            report('server')
+            await sleepAbortable(delay, options.signal)
+            continue
+          }
+          console.error(`[llm-trace] ${options.provider}/${options.model} attempt ${attempt} IDLE-TIMEOUT throw +${Date.now() - wall0}ms`)
           throw new LlmError(`pi-ai stream idle timeout after ${streamIdleTimeoutMs}ms`, 'TIMEOUT', { cause: error })
         }
         if (options.signal?.aborted) {

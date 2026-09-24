@@ -711,7 +711,14 @@ function resolveModelReasoning(
   base: Model<Api> | undefined,
   defaultModelThinking?: false | PiAiReasoningEfforts,
 ): ModelReasoning {
-  const efforts = entry.reasoningEfforts
+  // Route-level defaultModelThinking fills in a model that declares no
+  // reasoningEfforts of its own and has none from the installed catalog —
+  // the documented "apply to a model with no reasoning of its own" path.
+  // Only an absent field falls back to the route default; an explicit null
+  // (a valueless YAML `reasoningEfforts:`) must still be rejected below.
+  const efforts = entry.reasoningEfforts === undefined
+    ? (base?.reasoning === true ? undefined : defaultModelThinking)
+    : entry.reasoningEfforts
   if (efforts === undefined) {
     // Reasoning rides the installed entry or is absent: a bare capability flag
     // would make pi-ai advertise effort levels with no `thinkingLevelMap` to
