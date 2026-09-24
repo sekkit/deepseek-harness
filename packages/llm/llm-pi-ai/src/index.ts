@@ -151,6 +151,7 @@ export function apply(ctx: Context, config: Config): void {
   ctx.inject(['settings'], (child) => { child.effect(() => child.settings.configure({ auto: false }, ctx.fiber)) })
   const settingsNs = ctx.fiber.entry?.options.id ?? NS
   let lastRaw: ReturnType<Config['providers']['get']> | undefined
+  let lastThinking: ReturnType<Config['defaultModelThinking']['get']> | undefined
   let memoized: ReadonlyMap<string, ResolvedPiAiProviderProfile> | undefined
   /**
    * The resolved profiles for the current configuration, memoized by the raw
@@ -163,9 +164,17 @@ export function apply(ctx: Context, config: Config): void {
    */
   const profiles = (): ReadonlyMap<string, ResolvedPiAiProviderProfile> => {
     const raw = config.providers.get()
-    if (raw === lastRaw && memoized !== undefined) return memoized
-    const next = resolveProfiles(structuredClone(raw) as import('./config.ts').Options['providers'], 'deferred')
+    // The plugin-wide thinking fallback is an input to resolution, so it joins
+    // the memo key: a deployment that only edits it still re-resolves.
+    const thinking = config.defaultModelThinking.get()
+    if (raw === lastRaw && thinking === lastThinking && memoized !== undefined) return memoized
+    const next = resolveProfiles(
+      structuredClone(raw) as import('./config.ts').Options['providers'],
+      'deferred',
+      structuredClone(thinking),
+    )
     lastRaw = raw
+    lastThinking = thinking
     memoized = next
     return next
   }
@@ -175,8 +184,14 @@ export function apply(ctx: Context, config: Config): void {
     if (this !== ctx.fiber) return raw
     const candidate = Config(raw as import('./config.ts').Options)
     assertServiceable(
-      { providers: structuredClone(candidate.providers.get()) } as import('./config.ts').Options,
-      { providers: structuredClone(config.providers.get()) } as import('./config.ts').Options,
+      {
+        defaultModelThinking: structuredClone(candidate.defaultModelThinking.get()),
+        providers: structuredClone(candidate.providers.get()),
+      } as import('./config.ts').Options,
+      {
+        defaultModelThinking: structuredClone(config.defaultModelThinking.get()),
+        providers: structuredClone(config.providers.get()),
+      } as import('./config.ts').Options,
     )
     return raw
   })

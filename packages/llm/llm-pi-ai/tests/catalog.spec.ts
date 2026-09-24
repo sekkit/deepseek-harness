@@ -10,7 +10,7 @@ import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import { getBuiltinModels } from '@earendil-works/pi-ai/providers/all'
 import { AssistantMessageEventStream } from '@earendil-works/pi-ai/utils/event-stream'
 import type { Api, Model, OpenAICompletionsCompat, Provider } from '@earendil-works/pi-ai'
-import { resolveProfiles } from '../src/config.ts'
+import { Config, resolveProfiles } from '../src/config.ts'
 import { createModels, createProvider, getSupportedThinkingLevels } from '../src/models.ts'
 import { buildProvider, supportedProtocols } from '../src/provider.ts'
 import { assemble } from './assemble.ts'
@@ -778,6 +778,64 @@ describe('defaultModelThinking', () => {
         models: [{ id: 'bare', contextWindow: 4096, maxTokens: 1024 }],
       },
     })).toThrow(/defaultModelThinking cannot be false/)
+  })
+
+  it('applies the plugin-wide fallback to a route that declares none of its own', () => {
+    const resolved = resolveProfiles({
+      'tjg-chat': {
+        api: 'openai-completions',
+        baseURL: 'https://gateway.test',
+        models: [{ id: 'gpt-6-luna', contextWindow: 4096, maxTokens: 1024 }],
+      },
+    }, 'strict', { off: 'none', low: 'low', medium: 'medium', high: 'high' })
+    const model = resolved.get('tjg-chat')?.piProvider?.getModels()[0]
+    if (model === undefined) throw new Error('model vanished')
+    expect(model.reasoning).toBe(true)
+    expect(getSupportedThinkingLevels(model)).toEqual(['off', 'low', 'medium', 'high'])
+  })
+
+  it("lets a route's own defaultModelThinking replace the plugin-wide fallback", () => {
+    const resolved = resolveProfiles({
+      overridden: {
+        api: 'openai-completions',
+        baseURL: 'https://overridden.test',
+        defaultModelThinking: { off: null, high: 'high' },
+        models: [{ id: 'bare', contextWindow: 4096, maxTokens: 1024 }],
+      },
+      inherited: {
+        api: 'openai-completions',
+        baseURL: 'https://inherited.test',
+        models: [{ id: 'bare', contextWindow: 4096, maxTokens: 1024 }],
+      },
+    }, 'strict', { off: null, low: 'low' })
+    const levels = (route: string): readonly string[] => {
+      const [model] = resolved.get(route)?.piProvider?.getModels() ?? []
+      if (model === undefined) throw new Error(`model vanished for ${route}`)
+      return getSupportedThinkingLevels(model)
+    }
+    expect(levels('overridden')).toEqual(['off', 'high'])
+    expect(levels('inherited')).toEqual(['off', 'low'])
+  })
+
+  it('does not override a catalog model with the plugin-wide fallback', () => {
+    const resolved = resolveProfiles({
+      deepseek: { models: [{ id: catalogModel.id }] },
+    }, 'strict', { off: null, low: 'low' })
+    const model = resolved.get('deepseek')?.piProvider?.getModels().find(m => m.id === catalogModel.id)
+    if (model === undefined) throw new Error('model vanished')
+    // Catalog deepseek models reason; the plugin-wide fallback must not replace that.
+    expect(model.reasoning).toBe(true)
+    expect(getSupportedThinkingLevels(model)).not.toEqual(['off', 'low'])
+  })
+
+  it('rejects a plugin-wide defaultModelThinking: false', () => {
+    expect(() => resolveProfiles({}, 'strict', false)).toThrow(/defaultModelThinking cannot be false/)
+  })
+
+  it('resolves no fallback when the plugin configuration omits the field', () => {
+    expect(Config({}).defaultModelThinking.get()).toBeUndefined()
+    expect(Config({ defaultModelThinking: { off: null, high: 'high' } }).defaultModelThinking.get())
+      .toEqual({ off: null, high: 'high' })
   })
 })
 

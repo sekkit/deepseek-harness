@@ -293,6 +293,14 @@ export interface ResolvedPiAiProviderProfile
 /** Plugin configuration: the provider routes this instance owns. */
 export interface Config {
   /**
+   * Thinking levels every route assumes for a model that declares none of its
+   * own and carries none from the installed catalog, so a deployment does not
+   * restate the same dialect on every route. A route's own
+   * `defaultModelThinking` replaces this one for that route. Omission leaves
+   * such models non-reasoning.
+   */
+  defaultModelThinking: Volatile<false | PiAiReasoningEfforts | undefined>
+  /**
    * pi-ai provider routes, keyed by provider. An empty (or omitted) dict is
    * the dormant settings-driven posture: the adapter mounts with no routes
    * and registers them the moment a settings section supplies profiles.
@@ -300,8 +308,10 @@ export interface Config {
   providers: Volatile<Record<string, PiAiProviderProfile>>
 }
 
-/** Plain options accepted by the provider resolver. */
-export type Options = { [K in keyof Config]?: Config[K] extends Volatile<infer T> ? T : never }
+/** Plain options accepted by the provider resolver; an absent optional value is an absent property. */
+export type Options = {
+  [K in keyof Config]?: Config[K] extends Volatile<infer T> ? Exclude<T, undefined> : never
+}
 
 const thinkingBudgets = z.object({
   minimal: z.number(),
@@ -428,6 +438,7 @@ const profile = z.object({
 
 /** Runtime schema for {@link Config}. */
 export const Config = z.object({
+  defaultModelThinking: z.union([z.const(false), reasoningEfforts]).volatile(),
   providers: z.dict(profile).default({}).volatile(),
 })
 
@@ -442,7 +453,7 @@ export const Config = z.object({
 export function assertServiceable(config: Options, previous?: Options): void {
   const changed = Object.fromEntries(Object.entries(config.providers ?? {}).filter(([provider, profile]) =>
     !deepEqualJson(profile, previous?.providers?.[provider])))
-  resolveProfiles(changed)
+  resolveProfiles(changed, 'strict', config.defaultModelThinking)
 }
 
 /** Reject removed pre-release profile fields and name their replacements. */
@@ -483,14 +494,22 @@ function assertValidHeaders(provider: string, headers: Readonly<Record<string, s
  * routes. An omitted dict resolves to the empty, dormant route set.
  * @param providers - configured provider profiles keyed by route.
  * @param validation - writes require a complete catalog; stored reads retain catalog diagnostics.
+ * @param defaultModelThinking - thinking levels every route assumes for an undeclared model; a route's own field replaces it.
  * @returns validated profiles in configuration order.
  */
 export function resolveProfiles(
   providers: Readonly<Record<string, PiAiProviderProfile>> | undefined,
   validation: 'strict' | 'deferred' = 'strict',
+  defaultModelThinking?: false | PiAiReasoningEfforts,
 ): Map<string, ResolvedPiAiProviderProfile> {
   if (Array.isArray(providers)) {
     throw new Error('llm-pi-ai: providers is now a dict keyed by provider route, not an array of profiles')
+  }
+  if (defaultModelThinking === false) {
+    throw new Error(
+      'llm-pi-ai: defaultModelThinking cannot be false;'
+      + ' omit the field to leave undeclared models non-reasoning',
+    )
   }
   const entries = Object.entries(providers ?? {})
   const resolved = new Map<string, ResolvedPiAiProviderProfile>()
@@ -539,6 +558,8 @@ export function resolveProfiles(
         + ' omit the field to leave undeclared models non-reasoning',
       )
     }
+    // The route's own field replaces the plugin-wide default for this route.
+    const routeModelThinking = source.defaultModelThinking ?? defaultModelThinking
     // The route key, not the installed provider's own name: the directory has
     // always shown route keys, and a catalog route must not silently rename
     // itself on every configuration surface just because it gained a profile.
@@ -563,7 +584,7 @@ export function resolveProfiles(
         ...source.modelOverrides === undefined ? {} : { modelOverrides: source.modelOverrides },
         ...source.compat === undefined ? {} : { compat: source.compat },
         defaultInput,
-        ...source.defaultModelThinking === undefined ? {} : { defaultModelThinking: source.defaultModelThinking },
+        ...routeModelThinking === undefined ? {} : { defaultModelThinking: routeModelThinking },
         defaultContextWindow: source.defaultContextWindow ?? DEFAULT_CONTEXT_WINDOW,
         defaultMaxTokens: source.defaultMaxTokens ?? DEFAULT_MAX_TOKENS,
       }, validation)
