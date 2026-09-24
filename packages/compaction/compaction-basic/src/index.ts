@@ -87,6 +87,8 @@ const summarizationModelSchema = z.string()
 const maxTokensSchema = z.number().step(1).min(1)
 const compactionRetriesSchema = z.number().step(1).min(0)
 const maxOverflowRetriesSchema = z.number().step(1).min(0)
+const maxSpanTokensSchema = z.number().step(1).min(1)
+const maxPressureAttemptsSchema = z.number().step(1).min(1)
 
 const modelPolicy: z<ModelCompactPolicyConfig> = z.object({
   provider: z.string().required(),
@@ -100,6 +102,8 @@ const modelPolicy: z<ModelCompactPolicyConfig> = z.object({
   maxTokens: maxTokensSchema,
   compactionRetries: compactionRetriesSchema,
   maxOverflowRetries: maxOverflowRetriesSchema,
+  maxSpanTokens: maxSpanTokensSchema,
+  maxPressureAttempts: maxPressureAttemptsSchema,
 })
 
 /**
@@ -123,6 +127,8 @@ export class BasicCompactionEngine extends CompactionEngine {
     maxTokens: maxTokensSchema,
     compactionRetries: compactionRetriesSchema,
     maxOverflowRetries: maxOverflowRetriesSchema,
+    maxSpanTokens: maxSpanTokensSchema,
+    maxPressureAttempts: maxPressureAttemptsSchema,
     modelPolicies: z.array(modelPolicy),
     auto: z.boolean(),
   })
@@ -296,7 +302,14 @@ export class BasicCompactionEngine extends CompactionEngine {
         prune.pruneSession(agent.session)
         measurement = meter.measure(agent.session)
       }
-      const range = selectCompactableRange(agent.session, measurement, 0)
+      // An explicit service-wide span cap also bounds overflow recovery: a
+      // grossly over-window session must still compact in processable chunks.
+      const range = selectCompactableRange(
+        agent.session,
+        measurement,
+        0,
+        this.config.maxSpanTokens,
+      )
       if (range === null) return null
       return this.compactRegion(range.start, range.end, agent, signal)
     }
@@ -327,8 +340,17 @@ export class BasicCompactionEngine extends CompactionEngine {
     if (measurement.totalTokens < spec.thresholdTokens) return null
 
     let result: CompactionResult | null = null
-    for (let attempt = 0; attempt <= spec.compactionRetries; attempt += 1) {
-      const range = selectCompactableRange(agent.session, measurement, spec.retainTokens)
+    for (
+      let attempt = 0;
+      attempt < spec.maxPressureAttempts && measurement.totalTokens >= spec.thresholdTokens;
+      attempt += 1
+    ) {
+      const range = selectCompactableRange(
+        agent.session,
+        measurement,
+        spec.retainTokens,
+        spec.maxSpanTokens,
+      )
       if (range === null) {
         /* v8 ignore else -- concrete replacement preserves a compactable checkpoint; subclass hooks cannot mutate it. */
         if (result === null) return null
@@ -339,9 +361,8 @@ export class BasicCompactionEngine extends CompactionEngine {
       measurement = meter.measure(agent.session)
       if (measurement.totalTokens < spec.thresholdTokens) return result
     }
-
     throw new Error(
-      `compaction still above threshold after ${spec.compactionRetries + 1} compaction attempts `
+      `compaction still above threshold after ${spec.maxPressureAttempts} compaction attempts `
       + `(${measurement.totalTokens} estimated tokens >= threshold ${spec.thresholdTokens})`,
     )
   }

@@ -26,6 +26,24 @@ export interface CompactionPolicyConfig {
   compactionRetries?: number
   /** Maximum retries after canonical context overflow; `0` disables recovery. Defaults to `1`. */
   maxOverflowRetries?: number
+  /**
+   * Hard cap, in estimated tokens, on the span a single summarization request
+   * may cover, sliced from the OLDEST surface edge. Bounding the span keeps a
+   * single compaction call (and therefore a resumed or runaway over-window
+   * session's summarization) processable by the upstream instead of sending
+   * the entire accumulated history in one over-capacity request. Defaults to
+   * `contextWindow × (thresholdRatio − retentionFraction)`, i.e. the ordinary
+   * one-shot span, so normal sessions are unchanged and only spans that would
+   * otherwise overflow get chunked.
+   */
+  maxSpanTokens?: number
+  /**
+   * Hard cap on bounded-span compaction attempts in a single pressure pass,
+   * used to converge a grossly over-window session back below threshold before
+   * the step's own model request is built. Defaults to `32`. When omitted, the
+   * legacy `compactionRetries + 1` bound is used instead.
+   */
+  maxPressureAttempts?: number
 }
 
 /** Exact provider/model override merged over the default compaction policy. */
@@ -58,6 +76,9 @@ interface ResolvedPolicyFields {
   readonly maxTokens: number
   readonly compactionRetries: number
   readonly maxOverflowRetries: number
+  /** Optional per-policy span cap; resolved against the model window at use time. */
+  readonly maxSpanTokens?: number
+  readonly maxPressureAttempts: number
 }
 
 /** Validated immutable config whose target-specific defaults remain unresolved. */
@@ -77,4 +98,8 @@ export type ResolvedCompactSpec = Omit<ResolvedTargetPolicy, 'retainRatio' | 're
   readonly contextWindow: number
   readonly thresholdTokens: number
   readonly retainTokens: number
+  /** Effective per-summarization span cap in estimated tokens (oldest-edge chunk). */
+  readonly maxSpanTokens: number
+  /** Effective attempt cap for one pressure-convergence pass over bounded spans. */
+  readonly maxPressureAttempts: number
 }

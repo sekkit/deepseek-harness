@@ -33,6 +33,8 @@ const POLICY_CONFIG_KEYS = [
   'maxTokens',
   'compactionRetries',
   'maxOverflowRetries',
+  'maxSpanTokens',
+  'maxPressureAttempts',
 ] as const
 
 /** Complete public top-level configuration key set. */
@@ -104,6 +106,8 @@ export function resolveConfig(config: BasicCompactionConfig = {}): ResolvedConfi
     maxTokens,
     compactionRetries: config.compactionRetries ?? 1,
     maxOverflowRetries: config.maxOverflowRetries ?? 1,
+    maxPressureAttempts: config.maxPressureAttempts
+      ?? (config.compactionRetries ?? 1) + 1,
     modelPolicies,
     auto: config.auto ?? true,
   })
@@ -135,6 +139,10 @@ export function resolveTargetPolicy(
     maxTokens: override?.maxTokens ?? config.maxTokens,
     compactionRetries: override?.compactionRetries ?? config.compactionRetries,
     maxOverflowRetries: override?.maxOverflowRetries ?? config.maxOverflowRetries,
+    ...(override?.maxSpanTokens ?? config.maxSpanTokens) === undefined
+      ? {}
+      : { maxSpanTokens: override?.maxSpanTokens ?? config.maxSpanTokens },
+    maxPressureAttempts: override?.maxPressureAttempts ?? config.maxPressureAttempts,
   })
 }
 
@@ -202,18 +210,47 @@ export function resolveCompactSpec(
       + `(${retainTokens}) must be less than threshold tokens ${thresholdTokens}`,
     )
   }
+  // One summarization span cap: an explicit `maxSpanTokens` limits how much
+  // of the oldest edge a single summarization call processes, so a grossly
+  // over-window (e.g. resumed) session stays processable. Unset means no
+  // cap: the ordinary one-shot span covers the whole compactable region,
+  // preserving upstream behavior for normal sessions.
+  const maxSpanTokens = policy.maxSpanTokens ?? Number.POSITIVE_INFINITY
   return deepFreeze({
     target: { ...policy.target },
     contextWindow,
     thresholdRatio: policy.thresholdRatio,
     thresholdTokens,
     retainTokens,
+    maxSpanTokens,
+    maxPressureAttempts: policy.maxPressureAttempts,
     summarizationProvider: policy.summarizationProvider,
     summarizationModel: policy.summarizationModel,
     maxTokens: policy.maxTokens,
     compactionRetries: policy.compactionRetries,
     maxOverflowRetries: policy.maxOverflowRetries,
   })
+}
+
+/**
+ * Resolve the effective per-summarization span cap for a routed target. The
+ * ordinary one-shot span is `contextWindow × (thresholdRatio − retention)`; an
+ * explicit `maxSpanTokens` wins. Kept pure so callers that must stay
+ * synchronous (e.g. manual compaction's lock acquisition) can bound a span
+ * without an async model-capacity lookup.
+ * @param policy - resolved policy for the routed target (or service defaults).
+ * @param retainTokens - the policy's resolved retained-tail budget.
+ * @param contextWindow - positive adapter-owned capacity for the target.
+ * @returns the effective oldest-edge span budget in estimated tokens.
+ */
+export function resolveMaxSpanTokens(
+  policy: Pick<ResolvedTargetPolicy, 'thresholdRatio' | 'maxSpanTokens'>,
+  retainTokens: number,
+  contextWindow: number,
+): number {
+  if (policy.maxSpanTokens !== undefined) return policy.maxSpanTokens
+  const retentionFraction = contextWindow > 0 ? retainTokens / contextWindow : 0
+  return Math.max(1, Math.floor(contextWindow * (policy.thresholdRatio - retentionFraction)))
 }
 
 /** Choose an explicit retention form or inherit the already-resolved fallback. */
@@ -285,6 +322,8 @@ function validatePolicy(
   const maxTokens = config.maxTokens
   const compactionRetries = config.compactionRetries
   const maxOverflowRetries = config.maxOverflowRetries
+  const maxSpanTokens = config.maxSpanTokens
+  const maxPressureAttempts = config.maxPressureAttempts
   if (thresholdRatio !== undefined) assertRatio(`${name}.thresholdRatio`, thresholdRatio)
   if (headroomTokens !== undefined) assertNonNegativeInteger(`${name}.headroomTokens`, headroomTokens)
   if (retainRatio !== undefined) assertRatio(`${name}.retainRatio`, retainRatio)
@@ -298,6 +337,12 @@ function validatePolicy(
   }
   if (maxOverflowRetries !== undefined) {
     assertNonNegativeInteger(`${name}.maxOverflowRetries`, maxOverflowRetries)
+  }
+  if (maxSpanTokens !== undefined) {
+    assertPositiveInteger(`${name}.maxSpanTokens`, maxSpanTokens)
+  }
+  if (maxPressureAttempts !== undefined) {
+    assertPositiveInteger(`${name}.maxPressureAttempts`, maxPressureAttempts)
   }
 
   validateSummarizationPair(config, name)

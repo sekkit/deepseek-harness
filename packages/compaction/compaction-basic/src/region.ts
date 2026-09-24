@@ -108,16 +108,23 @@ function systemHead(session: Session, headSeq: SessionSeq): SessionEvent<'system
  * Resolve the next range starting at the first non-system surface node while
  * retaining a priced recent tail and never splitting an assistant
  * tool-call/result pair. A `system/message` at surface node 0 is never inside
- * the range; without one the range starts at node 0.
+ * the range; without one the range starts at node 0. The selected span is
+ * additionally bounded to `maxSpanTokens` estimated tokens sliced from the
+ * OLDEST surface edge, so a single summarization call on a grossly over-window
+ * (e.g. resumed) session stays processable instead of replaying the whole
+ * accumulated history in one over-capacity request. Spans that already fit the
+ * budget are returned verbatim, so ordinary sessions are unaffected.
  * @param session - session supplying authoritative current surface positions.
  * @param measurement - unified pressure and surface measurement from the conversation meter.
  * @param retainTokens - minimum recent tail budget retained verbatim.
+ * @param maxSpanTokens - maximum estimated-token budget for the selected span.
  * @returns the inclusive positional seq range to compact, or `null`.
  */
 export function selectCompactableRange(
   session: Session,
   measurement: TokenMeasurement,
   retainTokens: number,
+  maxSpanTokens = Number.POSITIVE_INFINITY,
 ): { start: SessionSeq; end: SessionSeq } | null {
   const pricedNodes = measurement.nodes
   if (pricedNodes.length === 0) return null
@@ -146,6 +153,34 @@ export function selectCompactableRange(
     keepFromIdx -= 1
   }
   if (keepFromIdx <= firstIdx) return null
+
+  if (maxSpanTokens < Number.POSITIVE_INFINITY) {
+    // Bound the span from the oldest edge, never cutting into the retained
+    // tail. Anything beyond the per-request budget is left for later
+    // compaction passes (capped by the caller's pressure-attempt budget).
+    let spanTokens = 0
+    let spanEnd = firstIdx
+    while (spanEnd < keepFromIdx && spanTokens < maxSpanTokens) {
+      // oxlint-disable-next-line typescript/no-non-null-assertion
+      spanTokens += pricedNodes[spanEnd]!.tokens
+      spanEnd += 1
+    }
+    let last = Math.min(spanEnd, keepFromIdx) - 1
+    if (last < firstIdx) return null
+    // Recede the end to a balanced region boundary so a step's tool-call/result
+    // pair at the chunk edge is kept whole rather than split by the span cap.
+    while (last > firstIdx) {
+      // oxlint-disable-next-line typescript/no-non-null-assertion
+      if (toolPairingBalancedBefore(session, surfaceNodes[last]!)) break
+      last -= 1
+    }
+    if (last < firstIdx) return null
+    // oxlint-disable-next-line typescript/no-non-null-assertion
+    const first = surfaceNodes[firstIdx]!
+    // oxlint-disable-next-line typescript/no-non-null-assertion
+    const cutoff = surfaceNodes[last]!
+    return { start: first, end: cutoff }
+  }
 
   // oxlint-disable-next-line typescript/no-non-null-assertion
   const first = surfaceNodes[firstIdx]!
